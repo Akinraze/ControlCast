@@ -1,6 +1,17 @@
+<p align="center">
+  <img src="assets/ControlCast_Logo.png" alt="ControlCast Logo" width="300">
+</p>
+
 # ControlCast – Custom Reactive Input Visuals for OBS
 
 **Create fully custom mouse, keyboard, controller, and hotkey visuals that react live to your inputs.**
+
+## Teaser Video
+
+See ControlCast in action before the full tutorial series is released.
+
+[Watch on TikTok](https://www.tiktok.com/@akinraze/video/7688072716196252941?is_from_webapp=1&sender_device=pc)  
+[Watch on YouTube Shorts](https://www.youtube.com/shorts/TX3y3MifFT0)
 
 ## About ControlCast
 
