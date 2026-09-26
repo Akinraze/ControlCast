@@ -18,6 +18,40 @@ See ControlCast in action before the full tutorial series is released.
 
 ---
 
+## Follow Along With the Tutorial
+
+Want to build the same ControlCast examples shown in the tutorial?
+
+Download the **exact project artwork used in the videos** so your OBS setup can follow along with the same source material.
+
+### MouseCast Project Files — SteelSeries Prime Wireless
+
+Includes the SteelSeries Prime Wireless base image plus the individual overlay graphics used for:
+
+- Left Click
+- Right Click
+- Wheel Down
+- Front Side Button
+- Rear Side Button
+
+**[Download MouseCast Project Files](https://github.com/Akinraze/ControlCast/releases/download/v4.0.0/MouseCast.Project.Files.zip)**
+
+### InputCast Project Files — Razer Tartarus V2
+
+Includes the Razer Tartarus V2 base image and organized individual control overlays for:
+
+- Row 1
+- Row 2
+- Row 3
+- Row 4
+- Thumb-control area
+
+**[Download InputCast Project Files](https://github.com/Akinraze/ControlCast/releases/download/v4.0.0/InputCast.Project.Files.zip)**
+
+> These packs are provided as tutorial follow-along assets. You are still free to build ControlCast layouts using your own devices, artwork, Sources, Groups, and designs.
+
+---
+
 ControlCast is a free OBS Python toolkit for building custom reactive on-screen controls from your own OBS Sources, Groups, and graphics.
 
 There are no required layouts, image styles, naming conventions, or asset folders. Build something realistic, minimal, over-the-top, or completely absurd.
