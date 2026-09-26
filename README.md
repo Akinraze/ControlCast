@@ -52,6 +52,28 @@ Includes the Razer Tartarus V2 base image and organized individual control overl
 
 ---
 
+## What You Need
+
+### Required
+
+- **OBS Studio** — ControlCast runs inside OBS and uses OBS Sources, Groups, Hotkeys, and Python scripting.
+- **Python 3.12.7 64-bit (Windows)** — the recommended and confirmed working Python version for the current Windows builds.
+- **A ControlCast module** — use MouseCast, InputCast, or both depending on the visual you want to build.
+
+### Optional / Used in the Tutorial
+
+- **Image-editing software** — GIMP is used in the tutorial examples, but it is **not required**.
+- Any capable image editor is suitable if it can:
+  - create or preserve transparent backgrounds
+  - export transparent PNG images
+  - make precise selections with tools such as a lasso, magic wand, or similar selection tools
+  - crop, resize, and layer images as needed
+- **Tutorial Project Files** — the supplied SteelSeries Prime Wireless and Razer Tartarus V2 artwork lets you follow along using the same example assets shown in the tutorial.
+
+The tutorial videos will walk through installation, configuration, artwork preparation, OBS setup, and ControlCast configuration step-by-step.
+
+---
+
 ControlCast is a free OBS Python toolkit for building custom reactive on-screen controls from your own OBS Sources, Groups, and graphics.
 
 There are no required layouts, image styles, naming conventions, or asset folders. Build something realistic, minimal, over-the-top, or completely absurd.
