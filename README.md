@@ -118,7 +118,18 @@ Both links cover the same complete walkthrough. View in landscape for easier-to-
 
 **OBS Studio** — required. ControlCast runs inside OBS and uses OBS Sources, Groups, Hotkeys, and Python scripting.
 
-**Python 3.12.7 64-bit** — recommended and confirmed working during development.
+**Python 3.12.7** — the Windows 64-bit version is recommended and confirmed working during development.
+
+### Direct Python 3.12.7 Downloads
+
+| Platform | Architecture | Installer |
+| --- | --- | --- |
+| Windows | 32-bit | [Download Python 3.12.7 for Windows (32-bit)](https://www.python.org/ftp/python/3.12.7/python-3.12.7.exe) |
+| Windows | 64-bit | [Download Python 3.12.7 for Windows (64-bit)](https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe) |
+| macOS | 32-bit | No installer available |
+| macOS | 64-bit | [Download Python 3.12.7 for macOS (64-bit)](https://www.python.org/ftp/python/3.12.7/python-3.12.7-macos11.pkg) |
+
+**For the tested Windows setup described above, use the Windows 64-bit installer.**
 
 **GIMP** — optional. Used in the tutorials for creating and editing transparent control graphics. Any capable image editor can be used instead.
 
