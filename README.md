@@ -50,6 +50,12 @@ Includes the Razer Tartarus V2 base image and organized individual control overl
 
 > These packs are provided as tutorial follow-along assets. You are still free to build ControlCast layouts using your own devices, artwork, Sources, Groups, and designs.
 
+### Watch the ControlCast Tutorial
+
+Use the project files above while following the complete setup tutorial:
+
+**[Watch the ControlCast Tutorial on YouTube](https://www.youtube.com/live/cfw0Dn_o0c8?si=nU7R7urMYWrS_k4L)**
+
 ---
 
 ## What You Need
@@ -401,14 +407,6 @@ Use your own OBS Sources and Groups.
 The only real limits are your time and your imagination.
 
 ---
-
-## ControlCast Tutorial
-
-Follow the complete ControlCast setup tutorial here:
-
-**[Watch the ControlCast Tutorial on YouTube](https://www.youtube.com/live/cfw0Dn_o0c8?si=nU7R7urMYWrS_k4L)**
-
-The tutorial walks through the ControlCast setup process and uses the same follow-along project files provided near the top of this README.
 
 
 ---
