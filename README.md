@@ -402,25 +402,14 @@ The only real limits are your time and your imagination.
 
 ---
 
-## Tutorial Video Series
+## ControlCast Tutorial
 
-### 1. Software Installation & Configuration
+Follow the complete ControlCast setup tutorial here:
 
-OBS Studio, Python 3.12.7, and initial setup.
+**[Watch the ControlCast Tutorial on YouTube](https://www.youtube.com/live/cfw0Dn_o0c8?si=nU7R7urMYWrS_k4L)**
 
-Video: `[LINK TO BE ADDED]`
+The tutorial walks through the ControlCast setup process and uses the same follow-along project files provided near the top of this README.
 
-### 2. Creating Graphics & Adding Them to OBS
-
-Finding images, editing them in GIMP, creating transparent assets, and arranging them in OBS.
-
-Video: `[LINK TO BE ADDED]`
-
-### 3. Installing & Configuring ControlCast
-
-Installing MouseCast and InputCast, creating profiles, assigning Sources and hotkeys, configuring Preview Mode, and testing reactive controls.
-
-Video: `[LINK TO BE ADDED]`
 
 ---
 
