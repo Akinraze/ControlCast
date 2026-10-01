@@ -54,7 +54,7 @@ Includes the Razer Tartarus V2 base image and organized individual control overl
 
 Use the project files above while following the complete setup tutorial:
 
-**[Watch the ControlCast Tutorial on YouTube](https://www.youtube.com/live/cfw0Dn_o0c8?si=nU7R7urMYWrS_k4L)**
+**[Watch the ControlCast Tutorial on YouTube](https://youtu.be/2vUFmFaLAFA)**
 
 ---
 
