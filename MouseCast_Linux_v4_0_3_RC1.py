@@ -1,5 +1,5 @@
 # OBS Studio Mouse Click Overlay
-# macOS left/right indicators, twenty programmable extra inputs, named profiles, and bounded mouse movement.
+# Linux (X11) left/right indicators, twenty programmable extra inputs, named profiles, and bounded mouse movement.
 # Requires OBS's obspython and a Python runtime compatible with the installed OBS.
 # Uses Python's standard library; no web server, pynput or AutoHotkey required.
 #
@@ -19,17 +19,14 @@ import time
 import json
 import os
 import re
-import base64
+import shutil
 import subprocess
+import threading
 
-VERSION = "MouseCast_macOS_v4_0_RC1"
+VERSION = "MouseCast_Linux_v4_0_3_RC1"
 POLL_MS = 16  # ~60 Hz; more than enough for OBS animation and much safer than 10 ms
 MOVEMENT_STARTUP_DELAY = 1.5  # seconds; lets OBS finish restoring scenes before movement begins
 
-# macOS CoreGraphics mouse input constants.
-CG_EVENT_SOURCE_STATE_COMBINED_SESSION = 0
-CG_MOUSE_BUTTON_LEFT = 0
-CG_MOUSE_BUTTON_RIGHT = 1
 
 left_source = None
 right_source = None
@@ -51,6 +48,14 @@ left_function = "Left Click"
 right_function = "Right Click"
 extra_functions = ["Extra Mouse Button %d" % (i + 1) for i in range(20)]
 
+
+# v4.0.3: which forced display state (None, "off", "preview") was last applied,
+# so the poller only touches OBS scenes when that state changes.
+forced_display_mode = None
+
+# v4.0.3: cached result of the "is the movement target an OBS Group?" check.
+group_check_ok = False
+group_check_until = 0.0
 
 movement_enabled = False
 movement_fault = False
@@ -101,60 +106,388 @@ extra_keys = ["OBS_HOTKEYS"] * EXTRA_BUTTONS
 extra_modifiers = ["NONE"] * EXTRA_BUTTONS
 modifier_only_down = [False] * EXTRA_BUTTONS
 
-# macOS virtual key codes (left/right variants where applicable).
-MAC_KEY_SHIFT_LEFT = 56
-MAC_KEY_SHIFT_RIGHT = 60
-MAC_KEY_CONTROL_LEFT = 59
-MAC_KEY_CONTROL_RIGHT = 62
-MAC_KEY_OPTION_LEFT = 58
-MAC_KEY_OPTION_RIGHT = 61
-MAC_KEY_COMMAND_LEFT = 55
-MAC_KEY_COMMAND_RIGHT = 54
+# ------------------------------
+# Linux X11 input layer
+# ------------------------------
+# Reads the mouse buttons, cursor position and modifier keys from the X11 display
+# server (libX11, part of every X11 desktop). Nothing is recorded, stored or sent
+# anywhere. On Wayland desktops the X11 server only sees XWayland windows, so
+# detection is limited there (the startup self-check says so).
+
+X11_SHIFT_L = 0xFFE1
+X11_SHIFT_R = 0xFFE2
+X11_CONTROL_L = 0xFFE3
+X11_CONTROL_R = 0xFFE4
+X11_ALT_L = 0xFFE9
+X11_ALT_R = 0xFFEA
+X11_SUPER_L = 0xFFEB
+X11_SUPER_R = 0xFFEC
+
+X11_BUTTON1_MASK = 1 << 8   # left button
+X11_BUTTON3_MASK = 1 << 10  # right button
+
+x11 = None
+x11_display = None
+x11_root = 0
+x11_failed = False
+_x11_keycodes = {}
+_x11_keymap = None
+_x11_keymap_time = 0.0
 
 
-class CGPoint(ctypes.Structure):
-    _fields_ = [
-        ("x", ctypes.c_double),
-        ("y", ctypes.c_double),
-    ]
-
-
-cg = None
-cf = None
-try:
-    cg = ctypes.CDLL(
-        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+def is_wayland_session():
+    return (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
     )
-    cf = ctypes.CDLL(
-        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
-    )
 
-    cg.CGEventCreate.argtypes = [ctypes.c_void_p]
-    cg.CGEventCreate.restype = ctypes.c_void_p
-    cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
-    cg.CGEventGetLocation.restype = CGPoint
-    cg.CGEventSourceButtonState.argtypes = [ctypes.c_int32, ctypes.c_uint32]
-    cg.CGEventSourceButtonState.restype = ctypes.c_bool
-    cg.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
-    cg.CGEventSourceKeyState.restype = ctypes.c_bool
-    cf.CFRelease.argtypes = [ctypes.c_void_p]
-    cf.CFRelease.restype = None
-except Exception:
-    cg = None
-    cf = None
+
+def x11_ready():
+    """Open the X11 connection on first use. Returns True when input can be read."""
+    global x11, x11_display, x11_root, x11_failed
+    if x11_display:
+        return True
+    if x11_failed:
+        return False
+    try:
+        if x11 is None:
+            lib = None
+            for name in ("libX11.so.6", "libX11.so"):
+                try:
+                    lib = ctypes.CDLL(name)
+                    break
+                except OSError:
+                    continue
+            if lib is None:
+                raise OSError("libX11 not found")
+            lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            lib.XOpenDisplay.restype = ctypes.c_void_p
+            lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            lib.XDefaultRootWindow.restype = ctypes.c_ulong
+            lib.XQueryPointer.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            lib.XQueryPointer.restype = ctypes.c_int
+            lib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+            lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            lib.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x11 = lib
+        display = x11.XOpenDisplay(None)
+        if not display:
+            raise OSError("no X11 display (is DISPLAY set?)")
+        x11_display = display
+        x11_root = x11.XDefaultRootWindow(display)
+        _x11_keycodes.clear()
+        return True
+    except Exception as exc:
+        x11_failed = True
+        log("X11 input unavailable: %s" % exc)
+        return False
+
+
+def x11_close():
+    global x11_display, x11_failed
+    if x11 is not None and x11_display:
+        try:
+            x11.XCloseDisplay(x11_display)
+        except Exception:
+            pass
+    x11_display = None
+    x11_failed = False
+
+
+def x11_pointer_state():
+    """Return (x, y, button_mask) for the pointer, or None."""
+    if not x11_ready():
+        return None
+    try:
+        root = ctypes.c_ulong()
+        child = ctypes.c_ulong()
+        rx, ry, wx, wy = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not x11.XQueryPointer(
+            x11_display, x11_root,
+            ctypes.byref(root), ctypes.byref(child),
+            ctypes.byref(rx), ctypes.byref(ry),
+            ctypes.byref(wx), ctypes.byref(wy),
+            ctypes.byref(mask),
+        ):
+            return None
+        return (float(rx.value), float(ry.value), int(mask.value))
+    except Exception:
+        return None
+
+
+def is_x11_key_down(keysym):
+    """True while the key for this X11 keysym is physically held."""
+    global _x11_keymap, _x11_keymap_time
+    if not x11_ready():
+        return False
+    try:
+        keycode = _x11_keycodes.get(keysym)
+        if keycode is None:
+            keycode = int(x11.XKeysymToKeycode(x11_display, keysym))
+            _x11_keycodes[keysym] = keycode
+        if not keycode:
+            return False
+        now = time.monotonic()
+        if _x11_keymap is None or now - _x11_keymap_time > 0.005:
+            buffer = (ctypes.c_char * 32)()
+            x11.XQueryKeymap(x11_display, buffer)
+            _x11_keymap = bytes(buffer.raw)
+            _x11_keymap_time = now
+        return bool(_x11_keymap[keycode // 8] & (1 << (keycode % 8)))
+    except Exception:
+        return False
+
+
+# Mouse Wheel Up / Down is a Windows-only feature for now. These placeholders
+# keep the shared code paths working; on Linux the wheel is never listened to.
+WHEEL_PULSE_SECONDS = 0.150
+wheel_hook_thread = None
+wheel_hook_ready = False
+wheel_event_lock = threading.Lock()
+wheel_up_events = 0
+wheel_down_events = 0
+wheel_up_until = 0.0
+wheel_down_until = 0.0
+
+
+def start_wheel_hook():
+    return
+
+
+def stop_wheel_hook():
+    return
+
+
+def wheel_input_needed():
+    """Mouse Wheel inputs are Windows-only; Linux never starts a listener."""
+    return False
+
+
+def sync_wheel_hook():
+    """v4.0.3: run the system-wide wheel listener only while a slot uses it.
+
+    The listener sees every mouse event on the PC, so it is not left running
+    for profiles that never use the wheel.
+    """
+    global wheel_up_events, wheel_down_events
+    if wheel_input_needed() and loaded:
+        start_wheel_hook()
+    elif wheel_hook_thread is not None:
+        stop_wheel_hook()
+        with wheel_event_lock:
+            wheel_up_events = 0
+            wheel_down_events = 0
+
+
+def consume_wheel_events():
+    global wheel_up_events, wheel_down_events
+    global wheel_up_until, wheel_down_until
+
+    with wheel_event_lock:
+        up_count = wheel_up_events
+        down_count = wheel_down_events
+        wheel_up_events = 0
+        wheel_down_events = 0
+
+    now = time.monotonic()
+    if up_count:
+        wheel_up_until = now + WHEEL_PULSE_SECONDS
+    if down_count:
+        wheel_down_until = now + WHEEL_PULSE_SECONDS
 
 
 def log(message):
-    print("[MouseCast] " + str(message))
+    print("[MouseCast] " + scrub_text(message))
+
+
+# ------------------------------
+# v4.0.2 safety helpers
+# ------------------------------
+# PRIVACY NOTE: ControlCast reads only the inputs you configure (mouse buttons,
+# the specific keys / modifiers you assign, and mouse-wheel events). It does not
+# record, store or transmit keystrokes, cursor paths or window contents, and it
+# contains no network code.
+
+_WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % n for n in range(1, 10)}
+    | {"LPT%d" % n for n in range(1, 10)}
+)
+
+
+def scrub_text(text):
+    """Replace your home folder path with ~ so logs and pop-ups are safe to share."""
+    try:
+        text = str(text)
+        home = os.path.expanduser("~")
+        if home and home != "~" and len(home) > 3:
+            for variant in {home, home.replace("\\", "/")}:
+                text = re.sub(re.escape(variant), "~", text, flags=re.IGNORECASE)
+        return text
+    except Exception:
+        return str(text)
+
+
+def clamp_finite(value, default, low, high):
+    """float(value) limited to [low, high]; NaN, infinity and junk fall back to default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if number != number or number in (float("inf"), float("-inf")):
+        return float(default)
+    return max(float(low), min(float(high), number))
+
+
+def _is_valid_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return True
+    except Exception:
+        return False
+
+
+def atomic_write_json(path, payload):
+    """Write JSON so a crash or power loss can never leave a half-written profile.
+
+    Data goes to a temp file first, the previous good file is kept as .bak, and the
+    temp file then replaces the real one in a single step.
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    if os.path.isfile(path) and _is_valid_json_file(path):
+        try:
+            with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+
+    last_error = None
+    for _attempt in range(5):  # antivirus scanners can briefly lock files on Windows
+        try:
+            os.replace(tmp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise last_error
+
+
+def read_json_file(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_json_with_backup(path, label):
+    """Read a profile; if it is corrupt, fall back to the last good .bak copy."""
+    try:
+        return read_json_file(path)
+    except (ValueError, OSError) as exc:
+        log("Profile '%s' could not be read (%s)." % (label, exc))
+        backup = path + ".bak"
+        if os.path.isfile(backup):
+            payload = read_json_file(backup)
+            log("Recovered profile '%s' from its backup copy." % label)
+            return payload
+        raise
+
+
+def remove_profile_files(path):
+    """Delete a profile and its .bak / .tmp companions so deleted stays deleted."""
+    for candidate in (path, path + ".bak", path + ".tmp"):
+        if os.path.isfile(candidate):
+            try:
+                os.remove(candidate)
+            except OSError as exc:
+                log("Could not remove %s: %s" % (os.path.basename(candidate), exc))
+
+
+def legacy_modifier_only_code(bindings):
+    """Older profiles stored a modifier-only input as an OBS hotkey with no key.
+
+    OBS can never fire those, so convert them to the polled MODIFIER_ONLY mode.
+    Returns a modifier code such as "SHIFT" or "CTRL+ALT", or None.
+    """
+    try:
+        for binding in bindings or []:
+            key = str(binding.get("key", "") or "OBS_KEY_NONE")
+            if key not in ("OBS_KEY_NONE", ""):
+                continue
+            mods = []
+            if binding.get("command"):
+                mods.append("COMMAND")
+            if binding.get("control"):
+                mods.append("CTRL")
+            if binding.get("shift"):
+                mods.append("SHIFT")
+            if binding.get("alt"):
+                mods.append("ALT")
+            if mods:
+                return "+".join(mods)
+    except Exception:
+        pass
+    return None
+
+
+def show_native_message(title, message, error=False, warning=False):
+    """Show a desktop pop-up without blocking OBS.
+
+    Uses zenity (GNOME and most desktops) or kdialog (KDE) when installed. The
+    text is passed as arguments, never through a shell, so it cannot change what
+    runs. When neither tool exists, the message is still in the Script Log.
+    """
+    safe_title = scrub_text(title)
+    safe_message = scrub_text(message)
+    kind = "error" if error else ("warning" if warning else "info")
+    candidates = [
+        ["zenity", "--%s" % kind, "--no-markup", "--title", safe_title, "--text", safe_message],
+        ["kdialog", "--title", safe_title,
+         {"error": "--error", "warning": "--sorry", "info": "--msgbox"}[kind], safe_message],
+    ]
+    for args in candidates:
+        if shutil.which(args[0]) is None:
+            continue
+        try:
+            subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            return True
+        except Exception as exc:
+            log("Could not open %s pop-up: %s" % (args[0], exc))
+    log("No pop-up tool (zenity or kdialog) found; see the message above in the Script Log.")
+    return False
 
 
 def script_description():
     return (
         "<b>%s</b><br><br>"
-        "macOS Community Test build for <b>MouseCast</b> with named mouse profiles and live profile switching.<br>"
+        "Linux (X11) Community Test build for <b>MouseCast</b> with named mouse profiles and live profile switching.<br>"
+        "<b>UNTESTED BY TESTERS:</b> this Linux build has not been run on a real Linux PC by any tester. It targets X11 desktops; on Wayland, mouse and modifier detection is limited. Expect problems and please report results on GitHub Issues.<br><br>"
         "Switch profiles while OBS is running or recording; no OBS restart is required.<br><b>Module:</b> MouseCast — physical mouse clicks, programmable mouse inputs, and reactive mouse movement visuals.<br><br>"
         "<b>Mouse inputs:</b> physical Left/Right Click plus a user-selected 0-20 additional programmable inputs "
-        "([01]-[20] additional inputs) for mice with large side-button layouts, keyboard shortcuts, modifiers, or OBS hotkeys.<br>"
+        "([01]-[20] additional inputs) for mice with large side-button layouts, keyboard shortcuts, modifiers, or OBS hotkeys. "
+        "Mouse Wheel Up/Down and Caps Lock combinations are Windows-only for now.<br>"
         "Set <b>Extra Programmable Inputs to Show</b> at the very top. After changing the count, refresh the Scripts panel "
         "by clicking another script and back (or close/reopen Tools &gt; Scripts) so OBS rebuilds the visible input blocks.<br>"
         "<b>Profiles:</b> each profile stores Sources, extra-button shortcut assignments/hotkeys, movement settings, "
@@ -170,7 +503,7 @@ def script_description():
         "After profile/settings changes it re-arms from the current physical cursor position before movement resumes.<br>"
         "Turning movement OFF, arranging the mouse, then ON saves that position as the profile's "
         "permanent rest position.<br><br>"
-        "Startup self-check logs PASS silently and opens a detached macOS dialog only for warnings/errors.<br>"
+        "Startup self-check logs PASS silently and opens a desktop pop-up (zenity or kdialog, if installed) only for warnings/errors.<br>"
         "<b>Safety:</b> no Python property-button callbacks are registered."
     ) % VERSION
 
@@ -194,8 +527,11 @@ def legacy_profile_path():
 
 
 def safe_profile_filename(name):
-    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", (name or "").strip())
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (name or "").strip())
     cleaned = cleaned.rstrip(" .")
+    if cleaned.split(".")[0].strip().upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned  # CON, NUL, COM1 ... are reserved device names on Windows
+    cleaned = cleaned[:100].rstrip(" .")
     return cleaned or "Default"
 
 
@@ -331,9 +667,18 @@ def plain_dicts_to_binding_array(bindings):
 
 
 def binding_from_ui(key_name, modifier_code):
-    if not key_name or key_name in ("OBS_HOTKEYS", "UNASSIGNED", "MODIFIER_ONLY"):
+    if not key_name or key_name in (
+        "OBS_HOTKEYS",
+        "UNASSIGNED",
+        "MODIFIER_ONLY",
+        "MOUSE_WHEEL_UP",
+        "MOUSE_WHEEL_DOWN",
+    ):
         return []
     mods = set((modifier_code or "NONE").split("+"))
+    # OBS hotkeys have no Caps Lock modifier; CAPS shortcuts are polled directly.
+    if "CAPS" in mods:
+        return []
     return [{
         "key": key_name,
         "shift": "SHIFT" in mods,
@@ -367,49 +712,84 @@ def apply_extra_ui_binding(index):
     load_extra_hotkey_binding(index, binding_from_ui(key_name, extra_modifiers[index]))
 
 
-def is_mac_key_down(key_code):
-    if cg is None:
-        return False
-    try:
-        return bool(cg.CGEventSourceKeyState(
-            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(key_code)
-        ))
-    except Exception:
-        return False
+def is_vk_down(vk_code):
+    """Windows key codes are not used on Linux."""
+    return False
+
+
+def key_name_to_vk(key_name):
+    """Caps Lock key combinations are Windows-only; nothing is mapped on Linux."""
+    return None
+
+
+def ui_key_is_down(key_name):
+    return False
 
 
 def modifier_combo_is_down(modifier_code):
     mods = set((modifier_code or "NONE").split("+"))
     mods.discard("NONE")
-    if not mods:
+    if not mods or "CAPS" in mods:
+        # Caps Lock combinations are a Windows-only feature (see self-check).
         return False
-
     checks = []
     if "SHIFT" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_SHIFT_LEFT) or is_mac_key_down(MAC_KEY_SHIFT_RIGHT))
+        checks.append(is_x11_key_down(X11_SHIFT_L) or is_x11_key_down(X11_SHIFT_R))
     if "CTRL" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_CONTROL_LEFT) or is_mac_key_down(MAC_KEY_CONTROL_RIGHT))
+        checks.append(is_x11_key_down(X11_CONTROL_L) or is_x11_key_down(X11_CONTROL_R))
     if "ALT" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_OPTION_LEFT) or is_mac_key_down(MAC_KEY_OPTION_RIGHT))
+        checks.append(is_x11_key_down(X11_ALT_L) or is_x11_key_down(X11_ALT_R))
     if "COMMAND" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_COMMAND_LEFT) or is_mac_key_down(MAC_KEY_COMMAND_RIGHT))
+        checks.append(is_x11_key_down(X11_SUPER_L) or is_x11_key_down(X11_SUPER_R))
     return bool(checks) and all(checks)
 
 
+def key_uses_caps_polling(index):
+    """A direct key + Caps Lock shortcut, which OBS hotkeys cannot express."""
+    mods = set((extra_modifiers[index] or "NONE").split("+"))
+    return "CAPS" in mods and extra_keys[index] not in (
+        "OBS_HOTKEYS", "UNASSIGNED", "MODIFIER_ONLY",
+        "MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN",
+    )
+
+
 def poll_extra_modifier_only_inputs():
+    global wheel_up_until, wheel_down_until
+
+    consume_wheel_events()
+    now = time.monotonic()
     changed = False
+
     for i in range(EXTRA_BUTTONS):
-        should_be_down = (
+        key_mode = extra_keys[i]
+        should_be_down = False
+
+        if (
             i < extra_button_count
             and master_enabled
             and not setup_preview_enabled
-            and extra_keys[i] == "MODIFIER_ONLY"
-            and modifier_combo_is_down(extra_modifiers[i])
-        )
-        if should_be_down != modifier_only_down[i]:
-            modifier_only_down[i] = should_be_down
-            extra_down[i] = should_be_down
-            changed = True
+        ):
+            if key_mode == "MODIFIER_ONLY":
+                should_be_down = modifier_combo_is_down(extra_modifiers[i])
+            elif key_uses_caps_polling(i):
+                should_be_down = (
+                    modifier_combo_is_down(extra_modifiers[i])
+                    and ui_key_is_down(key_mode)
+                )
+            elif key_mode == "MOUSE_WHEEL_UP":
+                should_be_down = now < wheel_up_until
+            elif key_mode == "MOUSE_WHEEL_DOWN":
+                should_be_down = now < wheel_down_until
+
+        if (key_mode in ("MODIFIER_ONLY", "MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN")
+                or key_uses_caps_polling(i)):
+            if should_be_down != extra_down[i]:
+                extra_down[i] = should_be_down
+                modifier_only_down[i] = (
+                    should_be_down if key_mode == "MODIFIER_ONLY" else False
+                )
+                changed = True
+
     if changed:
         update_click_visibility()
 
@@ -417,6 +797,10 @@ def pretty_key_name(raw_key):
     raw = (raw_key or "").strip()
     if not raw:
         return "Unassigned"
+    if raw == "MOUSE_WHEEL_UP":
+        return "Mouse Wheel Up"
+    if raw == "MOUSE_WHEEL_DOWN":
+        return "Mouse Wheel Down"
 
     try:
         if callable(getattr(obs, "obs_key_from_name", None)) and callable(getattr(obs, "obs_key_to_name", None)):
@@ -470,28 +854,30 @@ def collect_self_check():
     warnings = []
     passes = []
 
-    if cg is None or cf is None:
-        errors.append("macOS CoreGraphics input API unavailable")
+    if not x11_ready():
+        errors.append("Linux X11 input unavailable (no X11 display); mouse clicks and movement cannot be detected")
     else:
-        passes.append("macOS CoreGraphics mouse/input API")
+        passes.append("Linux X11 input")
+    if is_wayland_session():
+        warnings.append("Wayland desktop detected: input can only be read over X11/XWayland windows, so detection may not work while another app is focused. An X11 session is recommended.")
 
     passes.append("Profile: %s" % (current_profile or "Default"))
 
     if left_source:
         if get_source_by_name_exists(left_source):
-            passes.append("%s %s source found: %s" % (field_id(1), left_function, left_source))
+            passes.append("Left Click source found: %s" % left_source)
         else:
-            errors.append("%s source missing: %s" % (field_id(1), left_source))
+            errors.append("Left Click source missing: %s" % left_source)
     else:
-        warnings.append("%s %s has no OBS source" % (field_id(1), left_function))
+        warnings.append("Left Click has no OBS source")
 
     if right_source:
         if get_source_by_name_exists(right_source):
-            passes.append("%s %s source found: %s" % (field_id(2), right_function, right_source))
+            passes.append("Right Click source found: %s" % right_source)
         else:
-            errors.append("%s source missing: %s" % (field_id(2), right_source))
+            errors.append("Right Click source missing: %s" % right_source)
     else:
-        warnings.append("%s %s has no OBS source" % (field_id(2), right_function))
+        warnings.append("Right Click has no OBS source")
 
     assigned_source_fields = {}
     passes.append("Active extra programmable inputs: %d" % extra_button_count)
@@ -508,11 +894,25 @@ def collect_self_check():
 
             assigned_source_fields.setdefault(name, []).append(fid)
 
-            bindings = hotkey_bindings_to_plain(extra_hotkeys[i]) if i < len(extra_hotkeys) else []
-            if bindings:
-                passes.append("%s bound input: %s" % (fid, describe_bindings(bindings)))
+            if extra_keys[i] == "MODIFIER_ONLY":
+                if extra_modifiers[i] and extra_modifiers[i] != "NONE":
+                    passes.append("%s input: modifier only (%s)" % (
+                        fid,
+                        extra_modifiers[i].replace("+", " + ").title()
+                    ))
+                else:
+                    warnings.append("%s %s is Modifier Only but no modifier is selected" % (fid, func))
+            elif "CAPS" in set((extra_modifiers[i] or "NONE").split("+")):
+                warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on Linux" % (fid, func))
+            elif extra_keys[i] in ("MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN"):
+                warnings.append("%s %s uses %s, which is Windows-only; this input will not react on Linux" % (
+                    fid, func, pretty_key_name(extra_keys[i])))
             else:
-                warnings.append("%s %s has a source but no OBS hotkey binding" % (fid, func))
+                bindings = hotkey_bindings_to_plain(extra_hotkeys[i]) if i < len(extra_hotkeys) else []
+                if bindings:
+                    passes.append("%s bound input: %s" % (fid, describe_bindings(bindings)))
+                else:
+                    warnings.append("%s %s has a source but no OBS hotkey binding" % (fid, func))
 
 
     for source_name, fields in assigned_source_fields.items():
@@ -565,28 +965,7 @@ def format_self_check_text(status, lines):
     return "\n".join(body)
 
 
-def show_native_message(title, message, error=False, warning=False):
-    """Open a detached macOS dialog so OBS scripting/timers never block."""
-    try:
-        script = (
-            'on run argv\\n'
-            'set dialogTitle to item 1 of argv\\n'
-            'set dialogMessage to item 2 of argv\\n'
-            'display dialog dialogMessage with title dialogTitle buttons {"OK"} default button "OK"\\n'
-            'end run'
-        )
-        subprocess.Popen(
-            ["osascript", "-e", script, str(title), str(message)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-        return True
-    except Exception as exc:
-        log("Could not open non-blocking macOS diagnostic window: %s" % exc)
-        return False
+
 
 
 def show_diagnostics(status=None, lines=None):
@@ -690,9 +1069,8 @@ def save_profile(name=None, show_error=True):
     ensure_profiles_folder()
     path = profile_file_path(target)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(build_profile_payload(target), handle, indent=2, ensure_ascii=False)
-        log("Saved mouse profile '%s' -> %s" % (target, path))
+        atomic_write_json(path, build_profile_payload(target))
+        log("Saved mouse profile '%s' (%s)" % (target, os.path.basename(path)))
         return True
     except Exception as exc:
         log("Mouse profile save failed: %s" % exc)
@@ -754,18 +1132,16 @@ def write_payload_to_profile(name, payload):
     path = profile_file_path(name)
     copied = dict(payload)
     copied["schema"] = "controlcast_mouse_profiles"
-    copied["schema_version"] = 2
+    copied["schema_version"] = 3
     copied["profile_name"] = name
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(copied, handle, indent=2, ensure_ascii=False)
+    atomic_write_json(path, copied)
 
 
 def load_profile_payload(name):
     path = profile_file_path(name)
     if not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return load_json_with_backup(path, name)
 
 
 def reset_mouse_states_for_profile_switch():
@@ -820,6 +1196,11 @@ def apply_profile_payload(payload, settings):
         control = by_field.get(i + 3, {})
         key_mode = str(control.get("key_mode", "OBS_HOTKEYS")) or "OBS_HOTKEYS"
         modifiers = str(control.get("modifiers", "NONE")) or "NONE"
+        if "key_mode" not in control:
+            legacy_mods = legacy_modifier_only_code(control.get("hotkey_bindings", []))
+            if legacy_mods:
+                key_mode = "MODIFIER_ONLY"
+                modifiers = legacy_mods
         obs.obs_data_set_string(settings, "extra_source_%d" % i, str(control.get("source", "")))
         obs.obs_data_set_string(settings, "extra_key_%d" % i, key_mode)
         obs.obs_data_set_string(settings, "extra_mod_%d" % i, modifiers)
@@ -834,17 +1215,17 @@ def apply_profile_payload(payload, settings):
     obs.obs_data_set_bool(settings, "movement_enabled", bool(movement.get("enabled", False)))
     obs.obs_data_set_string(settings, "movement_scene", str(movement.get("scene", "")))
     obs.obs_data_set_string(settings, "movement_source", str(movement.get("source", "")))
-    obs.obs_data_set_double(settings, "range_x", float(movement.get("range_x", 60)))
-    obs.obs_data_set_double(settings, "sensitivity_x", float(movement.get("sensitivity_x", 0.5)))
-    obs.obs_data_set_double(settings, "range_y", float(movement.get("range_y", 40)))
-    obs.obs_data_set_double(settings, "sensitivity_y", float(movement.get("sensitivity_y", 0.5)))
-    obs.obs_data_set_double(settings, "smoothing", float(movement.get("smoothing", 12)))
-    obs.obs_data_set_double(settings, "return_speed", float(movement.get("return_speed", 4)))
+    obs.obs_data_set_double(settings, "range_x", clamp_finite(movement.get("range_x", 60), 60, 0, 2000))
+    obs.obs_data_set_double(settings, "sensitivity_x", clamp_finite(movement.get("sensitivity_x", 0.5), 0.5, 0.01, 10))
+    obs.obs_data_set_double(settings, "range_y", clamp_finite(movement.get("range_y", 40), 40, 0, 2000))
+    obs.obs_data_set_double(settings, "sensitivity_y", clamp_finite(movement.get("sensitivity_y", 0.5), 0.5, 0.01, 10))
+    obs.obs_data_set_double(settings, "smoothing", clamp_finite(movement.get("smoothing", 12), 12, 1, 60))
+    obs.obs_data_set_double(settings, "return_speed", clamp_finite(movement.get("return_speed", 4), 4, 0, 20))
     obs.obs_data_set_bool(settings, "invert_x", bool(movement.get("invert_x", False)))
     obs.obs_data_set_bool(settings, "invert_y", bool(movement.get("invert_y", False)))
     saved_rest_valid = bool(movement.get("saved_rest_valid", False))
-    saved_rest_x = float(movement.get("saved_rest_x", 0.0))
-    saved_rest_y = float(movement.get("saved_rest_y", 0.0))
+    saved_rest_x = clamp_finite(movement.get("saved_rest_x", 0.0), 0.0, -100000.0, 100000.0)
+    saved_rest_y = clamp_finite(movement.get("saved_rest_y", 0.0), 0.0, -100000.0, 100000.0)
     obs.obs_data_set_bool(settings, "saved_rest_valid", saved_rest_valid)
     obs.obs_data_set_double(settings, "saved_rest_x", saved_rest_x)
     obs.obs_data_set_double(settings, "saved_rest_y", saved_rest_y)
@@ -869,10 +1250,19 @@ def switch_profile(name, settings):
         return True
 
     save_profile(current_profile, show_error=False)
-    payload = load_profile_payload(target)
-    if payload is None:
-        payload = blank_profile_payload(target)
-        write_payload_to_profile(target, payload)
+    try:
+        payload = load_profile_payload(target)
+        if payload is None:
+            payload = blank_profile_payload(target)
+            write_payload_to_profile(target, payload)
+    except Exception as exc:
+        log("Mouse profile '%s' could not be loaded: %s" % (target, exc))
+        show_native_message(
+            "MouseCast - Profile Load Failed",
+            "Profile '%s' is damaged and has no usable backup.\n\n%s" % (target, exc),
+            error=True,
+        )
+        return False
 
     try:
         profile_operation_guard = True
@@ -917,6 +1307,13 @@ def execute_profile_action(action, settings):
     if not action:
         return
     new_name = obs.obs_data_get_string(settings, "new_profile_name").strip()
+    # v4.0.3: untick "Confirm / Execute" BEFORE doing anything. Applying a profile
+    # re-runs script_update(); while the box was still ticked, that re-ran this
+    # same action over and over (deleting one profile wiped Default hundreds of
+    # times; Reset opened hundreds of pop-ups). Now each click runs exactly once.
+    obs.obs_data_set_bool(settings, "profile_action_confirm", False)
+    if action in ("CREATE_BLANK", "DUPLICATE"):
+        obs.obs_data_set_string(settings, "new_profile_name", "")
     try:
         profile_operation_guard = True
         if action == "SAVE":
@@ -963,8 +1360,7 @@ def execute_profile_action(action, settings):
         elif action == "DELETE":
             doomed = current_profile or "Default"
             path = profile_file_path(doomed)
-            if os.path.isfile(path):
-                os.remove(path)
+            remove_profile_files(path)
 
             if doomed == "Default":
                 # Default is the permanent fallback name. Deleting it means:
@@ -1169,15 +1565,15 @@ def add_modifier_list(props, key, label):
         ("None", "NONE"),
         ("Ctrl", "CTRL"),
         ("Shift", "SHIFT"),
-        ("Option (Alt)", "ALT"),
+        ("Alt", "ALT"),
         ("Ctrl + Shift", "CTRL+SHIFT"),
-        ("Ctrl + Option", "CTRL+ALT"),
-        ("Shift + Option", "SHIFT+ALT"),
-        ("Ctrl + Shift + Option", "CTRL+SHIFT+ALT"),
-        ("Command", "COMMAND"),
-        ("Command + Ctrl", "COMMAND+CTRL"),
-        ("Command + Shift", "COMMAND+SHIFT"),
-        ("Command + Option", "COMMAND+ALT"),
+        ("Ctrl + Alt", "CTRL+ALT"),
+        ("Shift + Alt", "SHIFT+ALT"),
+        ("Ctrl + Shift + Alt", "CTRL+SHIFT+ALT"),
+        ("Super (Win)", "COMMAND"),
+        ("Super + Ctrl", "COMMAND+CTRL"),
+        ("Super + Shift", "COMMAND+SHIFT"),
+        ("Super + Alt", "COMMAND+ALT"),
     ]
     for display, value in choices:
         obs.obs_property_list_add_string(prop, display, value)
@@ -1344,11 +1740,11 @@ def script_defaults(settings):
 
     obs.obs_data_set_default_string(settings, "ui_extra_header", "[ EXTRA INPUTS ]")
     for i in range(EXTRA_BUTTONS):
-        slot = i + 3
+        # v4.0.3: heading now matches the field labels ([01]-[20]).
         obs.obs_data_set_default_string(
             settings,
             "ui_extra_divider_%d" % i,
-            "[ %02d ] INPUT" % slot,
+            "[ %02d ] EXTRA INPUT" % (i + 1),
         )
         obs.obs_data_set_default_string(settings, "extra_source_%d" % i, "")
         obs.obs_data_set_default_string(settings, "extra_key_%d" % i, "OBS_HOTKEYS")
@@ -1392,11 +1788,15 @@ def script_update(settings):
     global saved_rest_x, saved_rest_y, saved_rest_valid, startup_restored
     global movement_origin_x, movement_origin_y, movement_origin_valid
 
+    global forced_display_mode, group_check_until
+
     previous_movement_enabled = movement_enabled
-    previous_master_enabled = master_enabled
 
     if profile_operation_guard:
         return
+
+    forced_display_mode = None
+    group_check_until = 0.0
 
     obs.obs_data_set_string(
         settings,
@@ -1474,16 +1874,6 @@ def script_update(settings):
     for name in old_extra - set(name for name in extra_sources if name):
         if name not in {left_source, right_source}:
             set_source_visibility(name, False)
-
-    left_source_saved = normalize_source_name(obs.obs_data_get_string(settings, "left_source"))
-    right_source_saved = normalize_source_name(obs.obs_data_get_string(settings, "right_source"))
-
-    left_function = left_source_saved if left_source_saved else "Left Click"
-    right_function = right_source_saved if right_source_saved else "Right Click"
-
-    for i in range(EXTRA_BUTTONS):
-        saved_name = normalize_source_name(obs.obs_data_get_string(settings, "extra_source_%d" % i))
-        extra_functions[i] = saved_name if saved_name else "Extra Mouse Button %d" % (i + 1)
 
     movement_enabled = obs.obs_data_get_bool(settings, "movement_enabled")
     movement_scene = obs.obs_data_get_string(settings, "movement_scene")
@@ -1564,6 +1954,7 @@ def script_update(settings):
 
     startup_restored = False
     refresh_extra_hotkey_descriptions()
+    sync_wheel_hook()
 
     if not master_enabled:
         hide_all_indicator_sources()
@@ -1783,24 +2174,11 @@ def restore_saved_rest_position():
     return True
 
 def get_cursor_position():
-    """Return current macOS cursor position as (x, y), or None on failure."""
-    if cg is None or cf is None:
+    """Return the current cursor position as (x, y), or None on failure."""
+    state = x11_pointer_state()
+    if state is None:
         return None
-    event = None
-    try:
-        event = cg.CGEventCreate(None)
-        if not event:
-            return None
-        point = cg.CGEventGetLocation(event)
-        return (float(point.x), float(point.y))
-    except Exception:
-        return None
-    finally:
-        if event:
-            try:
-                cf.CFRelease(event)
-            except Exception:
-                pass
+    return (state[0], state[1])
 
 
 def poll_movement():
@@ -1822,7 +2200,14 @@ def poll_movement():
 
     # Never move a loose image/source. The configured movement target must be
     # an OBS Group so child button graphics retain their exact local positions.
-    if not movement_group_is_valid():
+    # v4.0.3: the full check runs at most twice a second; every individual move
+    # below still refuses anything that is not a Group (see with_movement_item).
+    global group_check_until, group_check_ok
+    now_check = time.monotonic()
+    if now_check >= group_check_until:
+        group_check_ok = movement_group_is_valid()
+        group_check_until = now_check + 0.5
+    if not group_check_ok:
         return
 
     # A permanent rest point is required before movement is permitted. The
@@ -1837,8 +2222,6 @@ def poll_movement():
         startup_restored = True
 
     if not movement_origin_valid:
-        movement_origin_x_local = saved_rest_x
-        movement_origin_y_local = saved_rest_y
         # restore_saved_rest_position normally establishes these globals. If a
         # settings refresh cleared them, restore again rather than guessing.
         if not restore_saved_rest_position():
@@ -1923,15 +2306,9 @@ def poll_movement():
         clear_movement_state(keep_origin=False)
 
 
-def is_button_down(mouse_button):
-    if cg is None:
-        return False
-    try:
-        return bool(cg.CGEventSourceButtonState(
-            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(mouse_button)
-        ))
-    except Exception:
-        return False
+def is_button_down(button_mask):
+    state = x11_pointer_state()
+    return bool(state and (state[2] & button_mask))
 
 
 def set_items_visibility(scene, source_name, visible):
@@ -1987,29 +2364,43 @@ def set_source_visibility(source_name, visible):
 
 
 def poll_mouse_buttons():
-    global left_down, right_down, movement_fault
+    global left_down, right_down, movement_fault, forced_display_mode
 
     if not master_enabled:
+        consume_wheel_events()  # drop wheel clicks so they don't flash later
         if left_down or right_down:
             left_down = False
             right_down = False
-        hide_all_indicator_sources()
+        # v4.0.3: hide once when switched off, instead of sweeping every
+        # scene 120 times a second.
+        if forced_display_mode != "off":
+            hide_all_indicator_sources()
+            forced_display_mode = "off"
         return
 
     if setup_preview_enabled:
         # Setup mode intentionally overrides reactive visibility so users can
-        # arrange assigned images/groups without fighting the 60 Hz input poller.
+        # arrange assigned images/groups. v4.0.3: shown once on entry, not
+        # re-forced every frame.
+        consume_wheel_events()
         left_down = False
         right_down = False
         for i in range(EXTRA_BUTTONS):
             extra_down[i] = False
-        show_all_indicator_sources()
+        if forced_display_mode != "preview":
+            show_all_indicator_sources()
+            forced_display_mode = "preview"
         return
+
+    if forced_display_mode is not None:
+        # Back to normal operation: re-apply the live input state once.
+        forced_display_mode = None
+        update_click_visibility()
 
     try:
         poll_extra_modifier_only_inputs()
-        new_left = is_button_down(CG_MOUSE_BUTTON_LEFT)
-        new_right = is_button_down(CG_MOUSE_BUTTON_RIGHT)
+        new_left = is_button_down(X11_BUTTON1_MASK)
+        new_right = is_button_down(X11_BUTTON3_MASK)
 
         if new_left != left_down or new_right != right_down:
             left_down = new_left
@@ -2067,6 +2458,7 @@ def script_load(settings):
     global movement_origin_x, movement_origin_y, movement_origin_valid
     global master_enabled, current_profile, startup_self_check
     global left_function, right_function, script_settings_ref
+    global extra_button_count
 
     print("--- %s loaded from %s ---" % (VERSION, __file__))
     ensure_profiles_folder()
@@ -2100,8 +2492,10 @@ def script_load(settings):
     movement_fault = False
     movement_start_after = time.monotonic() + MOVEMENT_STARTUP_DELAY
 
-    if cg is None or cf is None:
-        log("ERROR: macOS CoreGraphics input API is unavailable.")
+    if not x11_ready():
+        log("ERROR: Linux X11 input is unavailable (no X11 display).")
+    # v4.0.3: the wheel listener is started by sync_wheel_hook() (via the
+    # profile restore below) only when a slot uses Mouse Wheel Up/Down.
 
     left_down = False
     right_down = False
@@ -2166,6 +2560,8 @@ def script_load(settings):
 def script_unload():
     global loaded, left_down, right_down, script_settings_ref
 
+    stop_wheel_hook()
+
     if loaded:
         save_profile(current_profile, show_error=False)
 
@@ -2205,4 +2601,5 @@ def script_unload():
             pass
         script_settings_ref = None
 
+    x11_close()
     loaded = False

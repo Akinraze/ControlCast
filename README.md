@@ -100,7 +100,7 @@ There are no required layouts, image styles, naming conventions, or asset folder
 >
 > Earlier: v4.0.1 added Caps Lock modifiers (InputCast) and Mouse Wheel Up / Down (MouseCast).
 >
-> macOS remains **Community Test / RC1** at v4.0.
+> **macOS v4.0.3 RC2 and Linux v4.0.3 RC1 are UNTESTED BY TESTERS.** No tester has run them on a real Mac or a real Linux PC yet. They carry the same profile fixes as Windows v4.0.3, but expect problems and please report what you find.
 
 ### MouseCast v4.0.3
 
@@ -136,9 +136,13 @@ It supports:
 
 `MouseCast_Windows_v4_0_3.py`
 
-**macOS Community Test / RC1**
+**macOS Community Test v4.0.3 RC2 — ⚠️ UNTESTED BY TESTERS**
 
-`MouseCast_macOS_v4_0_RC1.py`
+`MouseCast_macOS_v4_0_3_RC2.py`
+
+**Linux (X11) Community Test v4.0.3 RC1 — ⚠️ UNTESTED BY TESTERS**
+
+`MouseCast_Linux_v4_0_3_RC1.py`
 
 ---
 
@@ -181,9 +185,13 @@ It supports:
 
 `InputCast_Windows_v4_0_3.py`
 
-**macOS Community Test / RC1**
+**macOS Community Test v4.0.3 RC2 — ⚠️ UNTESTED BY TESTERS**
 
-`InputCast_macOS_v4_0_RC1.py`
+`InputCast_macOS_v4_0_3_RC2.py`
+
+**Linux (X11) Community Test v4.0.3 RC1 — ⚠️ UNTESTED BY TESTERS**
+
+`InputCast_Linux_v4_0_3_RC1.py`
 
 ---
 
@@ -192,11 +200,12 @@ It supports:
 | Platform | MouseCast | InputCast | Status |
 | --- | --- | --- | --- |
 | Windows | `MouseCast_Windows_v4_0_3.py` | `InputCast_Windows_v4_0_3.py` | **Production** |
-| macOS | `MouseCast_macOS_v4_0_RC1.py` | `InputCast_macOS_v4_0_RC1.py` | **Community Test / RC1** |
+| macOS | `MouseCast_macOS_v4_0_3_RC2.py` | `InputCast_macOS_v4_0_3_RC2.py` | **⚠️ UNTESTED BY TESTERS** — Community Test RC2 |
+| Linux (X11) | `MouseCast_Linux_v4_0_3_RC1.py` | `InputCast_Linux_v4_0_3_RC1.py` | **⚠️ UNTESTED BY TESTERS** — Community Test RC1 |
 
 The Windows builds have been tested and refined directly during development. Profile handling in v4.0.3 was additionally checked with automated tests.
 
-The macOS builds are available for community testing but have **not yet been validated on physical Mac hardware**.
+The macOS and Linux builds are **UNTESTED BY TESTERS**. Nobody has run them on a real Mac or a real Linux PC. They are offered for community testing only.
 
 ---
 
@@ -214,13 +223,31 @@ During development, Python 3.13.x did not work correctly with this OBS Python sc
 
 ---
 
-## macOS Testing Status
+## macOS and Linux — UNTESTED BY TESTERS
 
-The macOS builds use macOS-specific input handling and are currently considered **Community Test / RC1**.
+> ⚠️ **The macOS and Linux files are UNTESTED BY TESTERS.** No tester has run them on real hardware. They may not work at all on your system.
 
-Mac users are invited to test and report:
+What was checked before release: the profile features (create, duplicate, switch, reset, delete) passed automated tests on both, and the Linux mouse and keyboard reading passed tests on a virtual X11 screen. That is **not** the same as a real person using them with OBS.
 
-- macOS version
+**Not available on macOS or Linux yet** (Windows only): Mouse Wheel Up / Down inputs and Caps Lock modifier combinations. The startup self-check says so if a profile uses them.
+
+### macOS notes
+
+- macOS may ask you to allow OBS under **System Settings → Privacy & Security** (Accessibility and/or Input Monitoring) before mouse and key detection works.
+
+### Linux notes
+
+- Built for **X11** desktops (for example Linux Mint, or Ubuntu/Fedora when you choose an "Xorg"/"X11" session at login).
+- On **Wayland** desktops, Linux deliberately stops apps from reading the mouse and keyboard while another app is focused, so MouseCast clicks/movement and modifier-only inputs may not react. The startup self-check warns when it detects Wayland. Ordinary OBS hotkeys may still work.
+- Pop-up messages use **zenity** or **kdialog** if installed; otherwise the messages are only in the OBS Script Log.
+- OBS on Linux uses the system's Python 3. Some OBS packages may not include Python scripting; check that **Tools → Scripts → Python Settings** shows Python as loaded.
+
+### Please report
+
+Mac and Linux users are invited to test and report:
+
+- operating system and version (for Linux: distribution, and X11 or Wayland)
+
 - OBS Studio version
 - Python version
 - MouseCast Left / Right Click detection
@@ -233,7 +260,7 @@ Mac users are invited to test and report:
 - any Accessibility or Input Monitoring permissions required
 - relevant OBS Script Log output
 
-Please do not assume the macOS files are production-ready until real-hardware testing confirms them.
+Please do not assume the macOS or Linux files are production-ready until real-hardware testing confirms them.
 
 ---
 
@@ -270,10 +297,15 @@ For Windows:
 - `MouseCast_Windows_v4_0_3.py`
 - `InputCast_Windows_v4_0_3.py`
 
-For macOS community testing:
+For macOS community testing (**UNTESTED BY TESTERS**):
 
-- `MouseCast_macOS_v4_0_RC1.py`
-- `InputCast_macOS_v4_0_RC1.py`
+- `MouseCast_macOS_v4_0_3_RC2.py`
+- `InputCast_macOS_v4_0_3_RC2.py`
+
+For Linux (X11) community testing (**UNTESTED BY TESTERS**):
+
+- `MouseCast_Linux_v4_0_3_RC1.py`
+- `InputCast_Linux_v4_0_3_RC1.py`
 
 ---
 
@@ -450,13 +482,13 @@ ControlCast was developed through extensive hands-on testing and iterative devel
 
 The Windows builds were tested and refined directly by the project maintainer.
 
-The macOS versions are currently community-test builds and have not yet been validated on physical Mac hardware.
+The macOS and Linux versions are community-test builds and are **UNTESTED BY TESTERS** on real hardware.
 
 ---
 
 ## Support and Bug Reports
 
-Use the repository's **Issues** section to report bugs, request features, or provide macOS test results.
+Use the repository's **Issues** section to report bugs, request features, or provide macOS / Linux test results.
 
 When reporting an issue, please include:
 

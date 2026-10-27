@@ -2,14 +2,15 @@ import obspython as obs
 import json
 import os
 import re
-import base64
-import subprocess
 import ctypes
+import shutil
+import subprocess
+import time
 
 
 MAX_BUTTONS = 65
 INPUT_COUNT_CHOICES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
-VERSION = "InputCast_macOS_v4_0_RC1"
+VERSION = "InputCast_Linux_v4_0_3_RC1"
 PROFILE_DIRNAME = "ControlCast_profiles"
 LEGACY_PROFILE_FILENAME = "push_to_enable_30_profile.json"
 
@@ -36,33 +37,12 @@ profile_operation_guard = False
 script_settings_ref = None
 loaded = False
 
-# macOS modifier-only polling state. OBS hotkey bindings require a primary key,
-# so modifier-only shortcuts (Shift, Ctrl, Alt, Win, or combinations) are
-# detected directly with CoreGraphics and then fed through the same
+# Linux modifier-only polling state. OBS hotkey bindings require a primary key,
+# so modifier-only shortcuts (Shift, Ctrl, Alt, Super, or combinations) are
+# read directly from the X11 display server and then fed through the same
 # visibility/reference-count logic as normal OBS hotkeys.
 MODIFIER_POLL_MS = 16
 modifier_only_down = [False] * MAX_BUTTONS
-
-CG_EVENT_SOURCE_STATE_COMBINED_SESSION = 0
-
-MAC_KEY_SHIFT_LEFT = 56
-MAC_KEY_SHIFT_RIGHT = 60
-MAC_KEY_CONTROL_LEFT = 59
-MAC_KEY_CONTROL_RIGHT = 62
-MAC_KEY_OPTION_LEFT = 58
-MAC_KEY_OPTION_RIGHT = 61
-MAC_KEY_COMMAND_LEFT = 55
-MAC_KEY_COMMAND_RIGHT = 54
-
-cg = None
-try:
-    cg = ctypes.CDLL(
-        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
-    )
-    cg.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
-    cg.CGEventSourceKeyState.restype = ctypes.c_bool
-except Exception:
-    cg = None
 
 
 # ------------------------------
@@ -70,7 +50,318 @@ except Exception:
 # ------------------------------
 
 def log(message):
-    print("[InputCast] " + str(message))
+    print("[InputCast] " + scrub_text(message))
+
+
+# ------------------------------
+# v4.0.2 safety helpers
+# ------------------------------
+# PRIVACY NOTE: ControlCast reads only the inputs you configure (mouse buttons,
+# the specific keys / modifiers you assign, and mouse-wheel events). It does not
+# record, store or transmit keystrokes, cursor paths or window contents, and it
+# contains no network code.
+
+_WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % n for n in range(1, 10)}
+    | {"LPT%d" % n for n in range(1, 10)}
+)
+
+
+def scrub_text(text):
+    """Replace your home folder path with ~ so logs and pop-ups are safe to share."""
+    try:
+        text = str(text)
+        home = os.path.expanduser("~")
+        if home and home != "~" and len(home) > 3:
+            for variant in {home, home.replace("\\", "/")}:
+                text = re.sub(re.escape(variant), "~", text, flags=re.IGNORECASE)
+        return text
+    except Exception:
+        return str(text)
+
+
+def clamp_finite(value, default, low, high):
+    """float(value) limited to [low, high]; NaN, infinity and junk fall back to default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if number != number or number in (float("inf"), float("-inf")):
+        return float(default)
+    return max(float(low), min(float(high), number))
+
+
+def _is_valid_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return True
+    except Exception:
+        return False
+
+
+def atomic_write_json(path, payload):
+    """Write JSON so a crash or power loss can never leave a half-written profile.
+
+    Data goes to a temp file first, the previous good file is kept as .bak, and the
+    temp file then replaces the real one in a single step.
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    if os.path.isfile(path) and _is_valid_json_file(path):
+        try:
+            with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+
+    last_error = None
+    for _attempt in range(5):  # antivirus scanners can briefly lock files on Windows
+        try:
+            os.replace(tmp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise last_error
+
+
+def read_json_file(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_json_with_backup(path, label):
+    """Read a profile; if it is corrupt, fall back to the last good .bak copy."""
+    try:
+        return read_json_file(path)
+    except (ValueError, OSError) as exc:
+        log("Profile '%s' could not be read (%s)." % (label, exc))
+        backup = path + ".bak"
+        if os.path.isfile(backup):
+            payload = read_json_file(backup)
+            log("Recovered profile '%s' from its backup copy." % label)
+            return payload
+        raise
+
+
+def remove_profile_files(path):
+    """Delete a profile and its .bak / .tmp companions so deleted stays deleted."""
+    for candidate in (path, path + ".bak", path + ".tmp"):
+        if os.path.isfile(candidate):
+            try:
+                os.remove(candidate)
+            except OSError as exc:
+                log("Could not remove %s: %s" % (os.path.basename(candidate), exc))
+
+
+def legacy_modifier_only_code(bindings):
+    """Older profiles stored a modifier-only input as an OBS hotkey with no key.
+
+    OBS can never fire those, so convert them to the polled MODIFIER_ONLY mode.
+    Returns a modifier code such as "SHIFT" or "CTRL+ALT", or None.
+    """
+    try:
+        for binding in bindings or []:
+            key = str(binding.get("key", "") or "OBS_KEY_NONE")
+            if key not in ("OBS_KEY_NONE", ""):
+                continue
+            mods = []
+            if binding.get("command"):
+                mods.append("COMMAND")
+            if binding.get("control"):
+                mods.append("CTRL")
+            if binding.get("shift"):
+                mods.append("SHIFT")
+            if binding.get("alt"):
+                mods.append("ALT")
+            if mods:
+                return "+".join(mods)
+    except Exception:
+        pass
+    return None
+
+
+def show_native_message(title, message, error=False, warning=False):
+    """Show a desktop pop-up without blocking OBS.
+
+    Uses zenity (GNOME and most desktops) or kdialog (KDE) when installed. The
+    text is passed as arguments, never through a shell, so it cannot change what
+    runs. When neither tool exists, the message is still in the Script Log.
+    """
+    safe_title = scrub_text(title)
+    safe_message = scrub_text(message)
+    kind = "error" if error else ("warning" if warning else "info")
+    candidates = [
+        ["zenity", "--%s" % kind, "--no-markup", "--title", safe_title, "--text", safe_message],
+        ["kdialog", "--title", safe_title,
+         {"error": "--error", "warning": "--sorry", "info": "--msgbox"}[kind], safe_message],
+    ]
+    for args in candidates:
+        if shutil.which(args[0]) is None:
+            continue
+        try:
+            subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            return True
+        except Exception as exc:
+            log("Could not open %s pop-up: %s" % (args[0], exc))
+    log("No pop-up tool (zenity or kdialog) found; see the message above in the Script Log.")
+    return False
+
+
+# ------------------------------
+# Linux X11 input layer
+# ------------------------------
+# Reads the mouse buttons, cursor position and modifier keys from the X11 display
+# server (libX11, part of every X11 desktop). Nothing is recorded, stored or sent
+# anywhere. On Wayland desktops the X11 server only sees XWayland windows, so
+# detection is limited there (the startup self-check says so).
+
+X11_SHIFT_L = 0xFFE1
+X11_SHIFT_R = 0xFFE2
+X11_CONTROL_L = 0xFFE3
+X11_CONTROL_R = 0xFFE4
+X11_ALT_L = 0xFFE9
+X11_ALT_R = 0xFFEA
+X11_SUPER_L = 0xFFEB
+X11_SUPER_R = 0xFFEC
+
+X11_BUTTON1_MASK = 1 << 8   # left button
+X11_BUTTON3_MASK = 1 << 10  # right button
+
+x11 = None
+x11_display = None
+x11_root = 0
+x11_failed = False
+_x11_keycodes = {}
+_x11_keymap = None
+_x11_keymap_time = 0.0
+
+
+def is_wayland_session():
+    return (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+
+def x11_ready():
+    """Open the X11 connection on first use. Returns True when input can be read."""
+    global x11, x11_display, x11_root, x11_failed
+    if x11_display:
+        return True
+    if x11_failed:
+        return False
+    try:
+        if x11 is None:
+            lib = None
+            for name in ("libX11.so.6", "libX11.so"):
+                try:
+                    lib = ctypes.CDLL(name)
+                    break
+                except OSError:
+                    continue
+            if lib is None:
+                raise OSError("libX11 not found")
+            lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            lib.XOpenDisplay.restype = ctypes.c_void_p
+            lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            lib.XDefaultRootWindow.restype = ctypes.c_ulong
+            lib.XQueryPointer.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            lib.XQueryPointer.restype = ctypes.c_int
+            lib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+            lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            lib.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x11 = lib
+        display = x11.XOpenDisplay(None)
+        if not display:
+            raise OSError("no X11 display (is DISPLAY set?)")
+        x11_display = display
+        x11_root = x11.XDefaultRootWindow(display)
+        _x11_keycodes.clear()
+        return True
+    except Exception as exc:
+        x11_failed = True
+        log("X11 input unavailable: %s" % exc)
+        return False
+
+
+def x11_close():
+    global x11_display, x11_failed
+    if x11 is not None and x11_display:
+        try:
+            x11.XCloseDisplay(x11_display)
+        except Exception:
+            pass
+    x11_display = None
+    x11_failed = False
+
+
+def x11_pointer_state():
+    """Return (x, y, button_mask) for the pointer, or None."""
+    if not x11_ready():
+        return None
+    try:
+        root = ctypes.c_ulong()
+        child = ctypes.c_ulong()
+        rx, ry, wx, wy = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not x11.XQueryPointer(
+            x11_display, x11_root,
+            ctypes.byref(root), ctypes.byref(child),
+            ctypes.byref(rx), ctypes.byref(ry),
+            ctypes.byref(wx), ctypes.byref(wy),
+            ctypes.byref(mask),
+        ):
+            return None
+        return (float(rx.value), float(ry.value), int(mask.value))
+    except Exception:
+        return None
+
+
+def is_x11_key_down(keysym):
+    """True while the key for this X11 keysym is physically held."""
+    global _x11_keymap, _x11_keymap_time
+    if not x11_ready():
+        return False
+    try:
+        keycode = _x11_keycodes.get(keysym)
+        if keycode is None:
+            keycode = int(x11.XKeysymToKeycode(x11_display, keysym))
+            _x11_keycodes[keysym] = keycode
+        if not keycode:
+            return False
+        now = time.monotonic()
+        if _x11_keymap is None or now - _x11_keymap_time > 0.005:
+            buffer = (ctypes.c_char * 32)()
+            x11.XQueryKeymap(x11_display, buffer)
+            _x11_keymap = bytes(buffer.raw)
+            _x11_keymap_time = now
+        return bool(_x11_keymap[keycode // 8] & (1 << (keycode % 8)))
+    except Exception:
+        return False
 
 
 def field_id(index):
@@ -93,8 +384,11 @@ def legacy_profile_path():
 
 
 def safe_profile_filename(name):
-    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", (name or "").strip())
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (name or "").strip())
     cleaned = cleaned.rstrip(" .")
+    if cleaned.split(".")[0].strip().upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned  # CON, NUL, COM1 ... are reserved device names on Windows
+    cleaned = cleaned[:100].rstrip(" .")
     return cleaned or "Default"
 
 
@@ -278,15 +572,15 @@ def add_modifier_list(props, key, label):
         ("None", "NONE"),
         ("Ctrl", "CTRL"),
         ("Shift", "SHIFT"),
-        ("Option (Alt)", "ALT"),
+        ("Alt", "ALT"),
         ("Ctrl + Shift", "CTRL+SHIFT"),
-        ("Ctrl + Option", "CTRL+ALT"),
-        ("Shift + Option", "SHIFT+ALT"),
-        ("Ctrl + Shift + Option", "CTRL+SHIFT+ALT"),
-        ("Command", "COMMAND"),
-        ("Command + Ctrl", "COMMAND+CTRL"),
-        ("Command + Shift", "COMMAND+SHIFT"),
-        ("Command + Option", "COMMAND+ALT"),
+        ("Ctrl + Alt", "CTRL+ALT"),
+        ("Shift + Alt", "SHIFT+ALT"),
+        ("Ctrl + Shift + Alt", "CTRL+SHIFT+ALT"),
+        ("Super (Win)", "COMMAND"),
+        ("Super + Ctrl", "COMMAND+CTRL"),
+        ("Super + Shift", "COMMAND+SHIFT"),
+        ("Super + Alt", "COMMAND+ALT"),
     ]
     for display, value in choices:
         obs.obs_property_list_add_string(prop, display, value)
@@ -457,6 +751,10 @@ def binding_from_ui(key_name, modifier_code):
     if not key_name or key_name in ("OBS_HOTKEYS", "UNASSIGNED", "MODIFIER_ONLY"):
         return []
     mods = set((modifier_code or "NONE").split("+"))
+    # OBS hotkey bindings have native modifier fields for Ctrl/Shift/Alt/Command,
+    # but not Caps Lock. Any shortcut containing CAPS is polled directly below.
+    if "CAPS" in mods:
+        return []
     return [{
         "key": key_name,
         "shift": "SHIFT" in mods,
@@ -486,48 +784,58 @@ def apply_ui_binding(index):
     if key_name == "OBS_HOTKEYS":
         return
     # UNASSIGNED and MODIFIER_ONLY intentionally clear any previous OBS binding.
-    # Modifier-only input is polled directly through macOS CoreGraphics instead.
+    # Modifier-only input is read directly from X11 instead.
     bindings = binding_from_ui(key_name, button_modifiers[index])
     load_hotkey_binding(index, bindings)
 
 
-def is_mac_key_down(key_code):
-    if cg is None:
-        return False
-    try:
-        return bool(cg.CGEventSourceKeyState(
-            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(key_code)
-        ))
-    except Exception:
-        return False
+def is_vk_down(vk_code):
+    """Windows key codes are not used on Linux."""
+    return False
+
+
+def key_name_to_vk(key_name):
+    """Caps Lock key combinations are Windows-only; nothing is mapped on Linux."""
+    return None
+
+
+def ui_key_is_down(key_name):
+    return False
 
 
 def modifier_combo_is_down(modifier_code):
     mods = set((modifier_code or "NONE").split("+"))
     mods.discard("NONE")
-    if not mods:
+    if not mods or "CAPS" in mods:
+        # Caps Lock combinations are a Windows-only feature (see self-check).
         return False
-
     checks = []
     if "SHIFT" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_SHIFT_LEFT) or is_mac_key_down(MAC_KEY_SHIFT_RIGHT))
+        checks.append(is_x11_key_down(X11_SHIFT_L) or is_x11_key_down(X11_SHIFT_R))
     if "CTRL" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_CONTROL_LEFT) or is_mac_key_down(MAC_KEY_CONTROL_RIGHT))
+        checks.append(is_x11_key_down(X11_CONTROL_L) or is_x11_key_down(X11_CONTROL_R))
     if "ALT" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_OPTION_LEFT) or is_mac_key_down(MAC_KEY_OPTION_RIGHT))
+        checks.append(is_x11_key_down(X11_ALT_L) or is_x11_key_down(X11_ALT_R))
     if "COMMAND" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_COMMAND_LEFT) or is_mac_key_down(MAC_KEY_COMMAND_RIGHT))
-
+        checks.append(is_x11_key_down(X11_SUPER_L) or is_x11_key_down(X11_SUPER_R))
     return bool(checks) and all(checks)
 
 
 def poll_modifier_only_inputs():
-    # Poll only active slots configured as MODIFIER_ONLY. Transitions are routed
-    # through hotkey_callback so shared-source reference counting remains intact.
+    # Poll active Modifier Only slots plus any direct shortcut containing CAPS.
+    # OBS does not expose Caps Lock as a native hotkey modifier, so CAPS combos
+    # are handled here and routed through the normal InputCast callback path.
     for i in range(MAX_BUTTONS):
         should_be_down = False
-        if i < input_count and button_keys[i] == "MODIFIER_ONLY":
-            should_be_down = modifier_combo_is_down(button_modifiers[i])
+        if i < input_count:
+            key_mode = button_keys[i]
+            modifier_code = button_modifiers[i]
+            mods = set((modifier_code or "NONE").split("+"))
+
+            if key_mode == "MODIFIER_ONLY":
+                should_be_down = modifier_combo_is_down(modifier_code)
+            elif "CAPS" in mods and key_mode not in ("OBS_HOTKEYS", "UNASSIGNED"):
+                should_be_down = modifier_combo_is_down(modifier_code) and ui_key_is_down(key_mode)
 
         if should_be_down != modifier_only_down[i]:
             modifier_only_down[i] = should_be_down
@@ -726,9 +1034,8 @@ def save_profile(name=None, show_error=True):
     ensure_profiles_folder()
     path = profile_path(target)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(build_profile_payload(target), handle, indent=2, ensure_ascii=False)
-        log("Saved profile '%s' -> %s" % (target, path))
+        atomic_write_json(path, build_profile_payload(target))
+        log("Saved profile '%s' (%s)" % (target, os.path.basename(path)))
         return True
     except Exception as exc:
         log("Profile save failed: %s" % exc)
@@ -770,16 +1077,14 @@ def write_payload_to_profile(name, payload):
     path = profile_path(name)
     payload = dict(payload)
     payload["profile_name"] = name
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    atomic_write_json(path, payload)
 
 
 def load_profile_payload(name):
     path = profile_path(name)
     if not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return load_json_with_backup(path, name)
 
 
 def apply_profile_payload(payload, settings):
@@ -815,6 +1120,11 @@ def apply_profile_payload(payload, settings):
         invert = bool(entry.get("invert", False))
         key_mode = str(entry.get("key_mode", "OBS_HOTKEYS")) or "OBS_HOTKEYS"
         modifiers = str(entry.get("modifiers", "NONE")) or "NONE"
+        if "key_mode" not in entry:
+            legacy_mods = legacy_modifier_only_code(entry.get("hotkey_bindings", []))
+            if legacy_mods:
+                key_mode = "MODIFIER_ONLY"
+                modifiers = legacy_mods
 
         button_sources[i] = source
         button_inverts[i] = invert
@@ -851,11 +1161,20 @@ def switch_profile(name, settings):
     # Save outgoing profile first so live switches never discard work.
     save_profile(current_profile, show_error=False)
 
-    payload = load_profile_payload(target)
-    if payload is None:
-        # A profile listed in UI should normally exist; if not, create blank.
-        payload = blank_profile_payload(target)
-        write_payload_to_profile(target, payload)
+    try:
+        payload = load_profile_payload(target)
+        if payload is None:
+            # A profile listed in UI should normally exist; if not, create blank.
+            payload = blank_profile_payload(target)
+            write_payload_to_profile(target, payload)
+    except Exception as exc:
+        log("Profile '%s' could not be loaded: %s" % (target, exc))
+        show_native_message(
+            "InputCast - Profile Load Failed",
+            "Profile '%s' is damaged and has no usable backup.\n\n%s" % (target, exc),
+            error=True,
+        )
+        return False
 
     try:
         profile_operation_guard = True
@@ -910,28 +1229,7 @@ def source_exists(name):
     return True
 
 
-def show_native_message(title, message, error=False, warning=False):
-    """Open a detached macOS result dialog so OBS scripting never blocks."""
-    try:
-        script = (
-            'on run argv\\n'
-            'set dialogTitle to item 1 of argv\\n'
-            'set dialogMessage to item 2 of argv\\n'
-            'display dialog dialogMessage with title dialogTitle buttons {"OK"} default button "OK"\\n'
-            'end run'
-        )
-        subprocess.Popen(
-            ["osascript", "-e", script, str(title), str(message)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-        return True
-    except Exception as exc:
-        log("Could not open macOS diagnostic window: %s" % exc)
-        return False
+
 
 
 def collect_self_check():
@@ -944,13 +1242,14 @@ def collect_self_check():
         idx < input_count and button_keys[idx] == "MODIFIER_ONLY"
         for idx in range(MAX_BUTTONS)
     )
-    if cg is None:
-        if uses_modifier_only:
-            errors.append("macOS CoreGraphics input API unavailable; Modifier Only inputs cannot be detected")
-        else:
-            warnings.append("macOS CoreGraphics input API unavailable; OBS-managed hotkeys can still operate")
+    target = errors if uses_modifier_only else warnings
+
+    if not x11_ready():
+        target.append("Linux X11 input unavailable (no X11 display); Modifier Only inputs cannot be detected (OBS-managed hotkeys can still work)")
     else:
-        passes.append("macOS CoreGraphics modifier input API")
+        passes.append("Linux X11 input")
+    if is_wayland_session():
+        warnings.append("Wayland desktop detected: input can only be read over X11/XWayland windows, so detection may not work while another app is focused. An X11 session is recommended.")
 
     for i in range(input_count):
         src = button_sources[i]
@@ -962,17 +1261,31 @@ def collect_self_check():
             passes.append("%s source found: %s" % (fid, src))
         else:
             errors.append("%s source missing: %s" % (fid, src))
+        mods = set((button_modifiers[i] or "NONE").split("+"))
         if button_keys[i] == "MODIFIER_ONLY":
             if button_modifiers[i] and button_modifiers[i] != "NONE":
                 passes.append("%s input: modifier only (%s)" % (fid, button_modifiers[i].replace("+", " + ").title()))
             else:
                 warnings.append("%s %s is Modifier Only but no modifier is selected" % (fid, src))
+        elif "CAPS" in mods:
+            warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on Linux" % (fid, src))
         else:
             bindings = slot_hotkey_bindings(i)
             if bindings:
                 passes.append("%s input: %s" % (fid, describe_bindings(bindings)))
             else:
                 warnings.append("%s %s has no hotkey binding" % (fid, src))
+
+    # v4.0.3: one OBS Source used by several slots must use the same Invert
+    # setting; otherwise the last slot silently decides how it behaves.
+    invert_by_source = {}
+    for i in range(input_count):
+        if button_sources[i]:
+            invert_by_source.setdefault(button_sources[i], []).append((field_id(i + 1), bool(button_inverts[i])))
+    for src, slots in invert_by_source.items():
+        if len(set(inv for _fid, inv in slots)) > 1:
+            warnings.append("%s is used by %s with different Invert settings; set them all the same" % (
+                src, ", ".join(fid for fid, _inv in slots)))
 
     if configured == 0:
         warnings.append("No active input slots have OBS Sources assigned")
@@ -1030,12 +1343,13 @@ def refresh_hotkey_descriptions():
 def script_description():
     return (
         "<b>%s</b><br><br>"
-        "macOS Community Test build for <b>InputCast</b> named profiles and live switching.<br>"
+        "Linux (X11) Community Test build for <b>InputCast</b> named profiles and live switching.<br>"
+        "<b>UNTESTED BY TESTERS:</b> this Linux build has not been run on a real Linux PC by any tester. It targets X11 desktops; on Wayland, mouse and modifier detection is limited. Expect problems and please report results on GitHub Issues.<br><br>"
         "Profiles can be switched while OBS is running/recording; no OBS restart is required.<br><b>Module:</b> InputCast — bind keys, modifiers, controller/special-device hotkeys, and other inputs to reactive OBS source actions.<br><br>"
         "<b>Profile controls:</b> select an Active Profile to switch live. Use New Profile Name + Profile Action, then check Confirm / Execute Selected Profile Action.<br>"
         "<b>Setup / Preview Mode:</b> when enabled, all assigned graphics are forced visible to help with placement and layout.<br>"
         "<b>Input count:</b> each profile can use 5 to 65 programmable inputs in steps of 5. Only active slots are registered in OBS Hotkeys.<br>"
-        "<b>Shortcut assignment:</b> choose a Key and Modifiers directly here, choose 'Modifier only' for Shift/Ctrl/Option/Command without a second key, or leave Key on 'Assign / keep binding in OBS Hotkeys' for controllers/special hardware.<br><br>"
+        "<b>Shortcut assignment:</b> choose a Key and Modifiers directly here, choose 'Modifier only' for Shift/Ctrl/Alt/Super without a second key, or leave Key on 'Assign / keep binding in OBS Hotkeys' for controllers/special hardware. Caps Lock combinations are Windows-only for now.<br><br>"
         "NOTE: The number of visible rows is determined when the Scripts panel is opened. If you change Input Count or switch to a profile with a different count, the new profile becomes active immediately, but close/reopen the Scripts window to refresh the number of displayed rows."
     ) % VERSION
 
@@ -1085,6 +1399,10 @@ def execute_profile_action(action, settings):
         return
 
     new_name = obs.obs_data_get_string(settings, "new_profile_name").strip()
+    # v4.0.3: untick "Confirm / Execute" before acting, so a settings refresh
+    # during the action can never run the same action a second time.
+    obs.obs_data_set_bool(settings, "execute_profile_action", False)
+    obs.obs_data_set_string(settings, "new_profile_name", "")
     try:
         profile_operation_guard = True
 
@@ -1121,8 +1439,7 @@ def execute_profile_action(action, settings):
         elif action == "DELETE":
             doomed = current_profile
             path = profile_path(doomed)
-            if os.path.isfile(path):
-                os.remove(path)
+            remove_profile_files(path)
 
             current_profile = "Default"
             obs.obs_data_set_string(settings, "selected_profile", "Default")
@@ -1299,3 +1616,4 @@ def script_unload():
         except Exception:
             pass
         script_settings_ref = None
+    x11_close()
