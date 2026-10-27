@@ -88,14 +88,21 @@ There are no required layouts, image styles, naming conventions, or asset folder
 
 ## Current Modules
 
-> **Latest Windows production update: v4.0.1**
+> **Latest Windows update: v4.0.3**
 >
-> - **InputCast:** added Caps Lock modifier support
-> - **MouseCast:** added direct Mouse Wheel Up / Mouse Wheel Down input support
+> - **MouseCast:** fixed a profile bug — deleting a profile could also wipe your **Default** profile, and "Reset selected profile to blank" could open hundreds of pop-up windows. Each profile action now runs exactly once.
+> - **MouseCast:** much lighter while switched off or in Setup / Preview Mode (it no longer re-scans every scene 120 times a second).
+> - **MouseCast:** the mouse-wheel listener now only runs when a profile actually uses Mouse Wheel Up / Down.
+> - **MouseCast:** added the Caps Lock modifier combinations InputCast already had.
+> - **MouseCast:** extra inputs are labelled `[01]`–`[20]` consistently, and the self-check names Left Click / Right Click plainly.
+> - **InputCast:** the startup self-check now warns when one OBS Source is used by several inputs with different Invert settings.
+> - **Both:** profiles are saved safely (a crash can't leave a half-written profile; the last good copy is kept as `.bak`), pop-up messages no longer launch PowerShell, and your Windows user-folder path is hidden in logs.
+>
+> Earlier: v4.0.1 added Caps Lock modifiers (InputCast) and Mouse Wheel Up / Down (MouseCast).
 >
 > macOS remains **Community Test / RC1** at v4.0.
 
-### MouseCast v4.0.1
+### MouseCast v4.0.3
 
 **MouseCast** is the dedicated mouse-visualization module.
 
@@ -127,7 +134,7 @@ It supports:
 
 **Windows production build**
 
-`MouseCast_Windows_v4_0_1.py`
+`MouseCast_Windows_v4_0_3.py`
 
 **macOS Community Test / RC1**
 
@@ -135,7 +142,7 @@ It supports:
 
 ---
 
-### InputCast v4.0.1
+### InputCast v4.0.3
 
 **InputCast** is the general reactive-input module.
 
@@ -172,7 +179,7 @@ It supports:
 
 **Windows production build**
 
-`InputCast_Windows_v4_0_1.py`
+`InputCast_Windows_v4_0_3.py`
 
 **macOS Community Test / RC1**
 
@@ -184,10 +191,10 @@ It supports:
 
 | Platform | MouseCast | InputCast | Status |
 | --- | --- | --- | --- |
-| Windows | `MouseCast_Windows_v4_0_1.py` | `InputCast_Windows_v4_0_1.py` | **Production** |
+| Windows | `MouseCast_Windows_v4_0_3.py` | `InputCast_Windows_v4_0_3.py` | **Production** |
 | macOS | `MouseCast_macOS_v4_0_RC1.py` | `InputCast_macOS_v4_0_RC1.py` | **Community Test / RC1** |
 
-The Windows v4.0.1 builds have been tested and refined directly during development.
+The Windows builds have been tested and refined directly during development. Profile handling in v4.0.3 was additionally checked with automated tests.
 
 The macOS builds are available for community testing but have **not yet been validated on physical Mac hardware**.
 
@@ -260,8 +267,8 @@ Choose the ControlCast module for your operating system.
 
 For Windows:
 
-- `MouseCast_Windows_v4_0_1.py`
-- `InputCast_Windows_v4_0_1.py`
+- `MouseCast_Windows_v4_0_3.py`
+- `InputCast_Windows_v4_0_3.py`
 
 For macOS community testing:
 

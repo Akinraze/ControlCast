@@ -19,12 +19,10 @@ import time
 import json
 import os
 import re
-import base64
-import subprocess
 import threading
 from ctypes import wintypes
 
-VERSION = "MouseCast_Windows_v4_0_1"
+VERSION = "MouseCast_Windows_v4_0_3"
 POLL_MS = 16  # ~60 Hz; more than enough for OBS animation and much safer than 10 ms
 MOVEMENT_STARTUP_DELAY = 1.5  # seconds; lets OBS finish restoring scenes before movement begins
 
@@ -51,6 +49,14 @@ left_function = "Left Click"
 right_function = "Right Click"
 extra_functions = ["Extra Mouse Button %d" % (i + 1) for i in range(20)]
 
+
+# v4.0.3: which forced display state (None, "off", "preview") was last applied,
+# so the poller only touches OBS scenes when that state changes.
+forced_display_mode = None
+
+# v4.0.3: cached result of the "is the movement target an OBS Group?" check.
+group_check_ok = False
+group_check_until = 0.0
 
 movement_enabled = False
 movement_fault = False
@@ -106,6 +112,7 @@ VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
+VK_CAPITAL = 0x14
 
 try:
     user32 = ctypes.windll.user32
@@ -189,7 +196,7 @@ def _wheel_hook_thread_main():
 
     try:
         kernel32 = ctypes.windll.kernel32
-        wheel_hook_thread_id = int(kernel32.GetCurrentThreadId())
+        this_thread_id = int(kernel32.GetCurrentThreadId())
 
         hook_type = ctypes.WINFUNCTYPE(
             ctypes.c_longlong,
@@ -217,6 +224,12 @@ def _wheel_hook_thread_main():
         except Exception:
             pass
 
+        try:
+            # Without these, 64-bit module handles are truncated to 32 bits.
+            kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+            kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        except Exception:
+            pass
         module_handle = kernel32.GetModuleHandleW(None)
         wheel_hook_handle = user32.SetWindowsHookExW(
             WH_MOUSE_LL,
@@ -229,6 +242,9 @@ def _wheel_hook_thread_main():
             log("Mouse wheel hook could not be installed.")
             return
 
+        # v4.0.3: publish the thread id only once the hook (and this thread's
+        # message queue) exist, so stop_wheel_hook()'s quit message can't be lost.
+        wheel_hook_thread_id = this_thread_id
         wheel_hook_ready = True
         log("Mouse wheel hook ready.")
 
@@ -272,6 +288,12 @@ def start_wheel_hook():
 def stop_wheel_hook():
     global wheel_hook_thread
 
+    if wheel_hook_thread is not None and wheel_hook_thread.is_alive():
+        for _wait in range(25):  # let a just-started hook thread publish its id
+            if wheel_hook_thread_id:
+                break
+            time.sleep(0.02)
+
     if user32 is not None and wheel_hook_thread_id:
         try:
             user32.PostThreadMessageW(
@@ -292,6 +314,30 @@ def stop_wheel_hook():
     wheel_hook_thread = None
 
 
+def wheel_input_needed():
+    """True when an active extra input is set to Mouse Wheel Up/Down."""
+    return any(
+        extra_keys[i] in ("MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN")
+        for i in range(extra_button_count)
+    )
+
+
+def sync_wheel_hook():
+    """v4.0.3: run the system-wide wheel listener only while a slot uses it.
+
+    The listener sees every mouse event on the PC, so it is not left running
+    for profiles that never use the wheel.
+    """
+    global wheel_up_events, wheel_down_events
+    if wheel_input_needed() and loaded:
+        start_wheel_hook()
+    elif wheel_hook_thread is not None:
+        stop_wheel_hook()
+        with wheel_event_lock:
+            wheel_up_events = 0
+            wheel_down_events = 0
+
+
 def consume_wheel_events():
     global wheel_up_events, wheel_down_events
     global wheel_up_until, wheel_down_until
@@ -310,7 +356,185 @@ def consume_wheel_events():
 
 
 def log(message):
-    print("[MouseCast] " + str(message))
+    print("[MouseCast] " + scrub_text(message))
+
+
+# ------------------------------
+# v4.0.2 safety helpers
+# ------------------------------
+# PRIVACY NOTE: ControlCast reads only the inputs you configure (mouse buttons,
+# the specific keys / modifiers you assign, and mouse-wheel events). It does not
+# record, store or transmit keystrokes, cursor paths or window contents, and it
+# contains no network code.
+
+_WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % n for n in range(1, 10)}
+    | {"LPT%d" % n for n in range(1, 10)}
+)
+
+
+def scrub_text(text):
+    """Replace the Windows user-profile folder so logs and popups are safe to share."""
+    try:
+        text = str(text)
+        home = os.path.expanduser("~")
+        if home and home != "~" and len(home) > 3:
+            for variant in {home, home.replace("\\", "/")}:
+                text = re.sub(re.escape(variant), "%USERPROFILE%", text, flags=re.IGNORECASE)
+        return text
+    except Exception:
+        return str(text)
+
+
+def clamp_finite(value, default, low, high):
+    """float(value) limited to [low, high]; NaN, infinity and junk fall back to default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if number != number or number in (float("inf"), float("-inf")):
+        return float(default)
+    return max(float(low), min(float(high), number))
+
+
+def _is_valid_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return True
+    except Exception:
+        return False
+
+
+def atomic_write_json(path, payload):
+    """Write JSON so a crash or power loss can never leave a half-written profile.
+
+    Data goes to a temp file first, the previous good file is kept as .bak, and the
+    temp file then replaces the real one in a single step.
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    if os.path.isfile(path) and _is_valid_json_file(path):
+        try:
+            with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+
+    last_error = None
+    for _attempt in range(5):  # antivirus scanners can briefly lock files on Windows
+        try:
+            os.replace(tmp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise last_error
+
+
+def read_json_file(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_json_with_backup(path, label):
+    """Read a profile; if it is corrupt, fall back to the last good .bak copy."""
+    try:
+        return read_json_file(path)
+    except (ValueError, OSError) as exc:
+        log("Profile '%s' could not be read (%s)." % (label, exc))
+        backup = path + ".bak"
+        if os.path.isfile(backup):
+            payload = read_json_file(backup)
+            log("Recovered profile '%s' from its backup copy." % label)
+            return payload
+        raise
+
+
+def remove_profile_files(path):
+    """Delete a profile and its .bak / .tmp companions so deleted stays deleted."""
+    for candidate in (path, path + ".bak", path + ".tmp"):
+        if os.path.isfile(candidate):
+            try:
+                os.remove(candidate)
+            except OSError as exc:
+                log("Could not remove %s: %s" % (os.path.basename(candidate), exc))
+
+
+def legacy_modifier_only_code(bindings):
+    """Older profiles stored a modifier-only input as an OBS hotkey with no key.
+
+    OBS can never fire those, so convert them to the polled MODIFIER_ONLY mode.
+    Returns a modifier code such as "SHIFT" or "CTRL+ALT", or None.
+    """
+    try:
+        for binding in bindings or []:
+            key = str(binding.get("key", "") or "OBS_KEY_NONE")
+            if key not in ("OBS_KEY_NONE", ""):
+                continue
+            mods = []
+            if binding.get("command"):
+                mods.append("COMMAND")
+            if binding.get("control"):
+                mods.append("CTRL")
+            if binding.get("shift"):
+                mods.append("SHIFT")
+            if binding.get("alt"):
+                mods.append("ALT")
+            if mods:
+                return "+".join(mods)
+    except Exception:
+        pass
+    return None
+
+
+MB_OK = 0x00000000
+MB_ICONERROR = 0x00000010
+MB_ICONWARNING = 0x00000030
+MB_ICONINFORMATION = 0x00000040
+MB_SETFOREGROUND = 0x00010000
+MB_TOPMOST = 0x00040000
+
+
+def show_native_message(title, message, error=False, warning=False):
+    """Show a Windows message box without blocking OBS and without launching any program.
+
+    The dialog lives on its own short-lived thread, so OBS timers keep running while
+    it is open. (v4.0.1 launched a hidden, encoded PowerShell process instead, which
+    antivirus tools commonly flag.)
+    """
+    if user32 is None:
+        return False
+    try:
+        flags = MB_OK | MB_SETFOREGROUND | MB_TOPMOST
+        if error:
+            flags |= MB_ICONERROR
+        elif warning:
+            flags |= MB_ICONWARNING
+        else:
+            flags |= MB_ICONINFORMATION
+        safe_title = scrub_text(title)
+        safe_message = scrub_text(message)
+
+        def _show():
+            try:
+                user32.MessageBoxW(None, safe_message, safe_title, flags)
+            except Exception as exc:
+                log("Diagnostic window failed: %s" % exc)
+
+        threading.Thread(target=_show, name="ControlCastMessageBox", daemon=True).start()
+        return True
+    except Exception as exc:
+        log("Could not show diagnostic window: %s" % exc)
+        return False
 
 
 def script_description():
@@ -320,7 +544,8 @@ def script_description():
         "Switch profiles while OBS is running or recording; no OBS restart is required.<br><b>Module:</b> MouseCast — physical mouse clicks, programmable mouse inputs, and reactive mouse movement visuals.<br><br>"
         "<b>Mouse inputs:</b> physical Left/Right Click plus a user-selected 0-20 additional programmable inputs "
         "([01]-[20] additional inputs) for mice with large side-button layouts, keyboard shortcuts, modifiers, OBS hotkeys, "
-        "and direct Mouse Wheel Up / Mouse Wheel Down events.<br>"
+        "and direct Mouse Wheel Up / Mouse Wheel Down events. Caps Lock combinations use direct Windows polling, "
+        "so pick the Shortcut Key here instead of leaving it on OBS Hotkeys.<br>"
         "Set <b>Extra Programmable Inputs to Show</b> at the very top. After changing the count, refresh the Scripts panel "
         "by clicking another script and back (or close/reopen Tools &gt; Scripts) so OBS rebuilds the visible input blocks.<br>"
         "<b>Profiles:</b> each profile stores Sources, extra-button shortcut assignments/hotkeys, movement settings, "
@@ -360,8 +585,11 @@ def legacy_profile_path():
 
 
 def safe_profile_filename(name):
-    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", (name or "").strip())
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (name or "").strip())
     cleaned = cleaned.rstrip(" .")
+    if cleaned.split(".")[0].strip().upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned  # CON, NUL, COM1 ... are reserved device names on Windows
+    cleaned = cleaned[:100].rstrip(" .")
     return cleaned or "Default"
 
 
@@ -506,6 +734,9 @@ def binding_from_ui(key_name, modifier_code):
     ):
         return []
     mods = set((modifier_code or "NONE").split("+"))
+    # OBS hotkeys have no Caps Lock modifier; CAPS shortcuts are polled directly.
+    if "CAPS" in mods:
+        return []
     return [{
         "key": key_name,
         "shift": "SHIFT" in mods,
@@ -548,6 +779,73 @@ def is_vk_down(vk_code):
         return False
 
 
+def key_name_to_vk(key_name):
+    # Windows virtual-key mapping for every directly selectable MouseCast key.
+    if not key_name:
+        return None
+
+    if key_name.startswith("OBS_KEY_"):
+        suffix = key_name[8:]
+    else:
+        suffix = key_name
+
+    if len(suffix) == 1 and suffix in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+        return ord(suffix)
+
+    if suffix.startswith("F") and suffix[1:].isdigit():
+        number = int(suffix[1:])
+        if 1 <= number <= 24:
+            return 0x70 + number - 1
+
+    if suffix.startswith("NUM") and len(suffix) == 4 and suffix[-1].isdigit():
+        return 0x60 + int(suffix[-1])
+
+    mapping = {
+        "SPACE": 0x20,
+        "RETURN": 0x0D,
+        "TAB": 0x09,
+        "ESCAPE": 0x1B,
+        "BACKSPACE": 0x08,
+        "DELETE": 0x2E,
+        "INSERT": 0x2D,
+        "HOME": 0x24,
+        "END": 0x23,
+        "PAGEUP": 0x21,
+        "PAGEDOWN": 0x22,
+        "UP": 0x26,
+        "DOWN": 0x28,
+        "LEFT": 0x25,
+        "RIGHT": 0x27,
+        "MINUS": 0xBD,
+        "EQUAL": 0xBB,
+        "BRACKETLEFT": 0xDB,
+        "BRACKETRIGHT": 0xDD,
+        "SEMICOLON": 0xBA,
+        "APOSTROPHE": 0xDE,
+        "COMMA": 0xBC,
+        "PERIOD": 0xBE,
+        "SLASH": 0xBF,
+        "BACKSLASH": 0xDC,
+        "ASCIITILDE": 0xC0,
+        "NUMPLUS": 0x6B,
+        "NUMMINUS": 0x6D,
+        "NUMASTERISK": 0x6A,
+        "NUMSLASH": 0x6F,
+        "NUMPERIOD": 0x6E,
+        "MOUSE1": 0x01,
+        "MOUSE2": 0x02,
+        "MOUSE3": 0x04,
+        "MOUSE4": 0x05,
+        "MOUSE5": 0x06,
+    }
+    return mapping.get(suffix)
+
+
+def ui_key_is_down(key_name):
+    vk = key_name_to_vk(key_name)
+    return False if vk is None else is_vk_down(vk)
+
+
 def modifier_combo_is_down(modifier_code):
     mods = set((modifier_code or "NONE").split("+"))
     mods.discard("NONE")
@@ -562,7 +860,19 @@ def modifier_combo_is_down(modifier_code):
         checks.append(is_vk_down(VK_MENU))
     if "COMMAND" in mods:
         checks.append(is_vk_down(VK_LWIN) or is_vk_down(VK_RWIN))
+    if "CAPS" in mods:
+        # Caps Lock physically held (not its on/off light), same as InputCast.
+        checks.append(is_vk_down(VK_CAPITAL))
     return bool(checks) and all(checks)
+
+
+def key_uses_caps_polling(index):
+    """A direct key + Caps Lock shortcut, which OBS hotkeys cannot express."""
+    mods = set((extra_modifiers[index] or "NONE").split("+"))
+    return "CAPS" in mods and extra_keys[index] not in (
+        "OBS_HOTKEYS", "UNASSIGNED", "MODIFIER_ONLY",
+        "MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN",
+    )
 
 
 def poll_extra_modifier_only_inputs():
@@ -583,12 +893,18 @@ def poll_extra_modifier_only_inputs():
         ):
             if key_mode == "MODIFIER_ONLY":
                 should_be_down = modifier_combo_is_down(extra_modifiers[i])
+            elif key_uses_caps_polling(i):
+                should_be_down = (
+                    modifier_combo_is_down(extra_modifiers[i])
+                    and ui_key_is_down(key_mode)
+                )
             elif key_mode == "MOUSE_WHEEL_UP":
                 should_be_down = now < wheel_up_until
             elif key_mode == "MOUSE_WHEEL_DOWN":
                 should_be_down = now < wheel_down_until
 
-        if key_mode in ("MODIFIER_ONLY", "MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN"):
+        if (key_mode in ("MODIFIER_ONLY", "MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN")
+                or key_uses_caps_polling(i)):
             if should_be_down != extra_down[i]:
                 extra_down[i] = should_be_down
                 modifier_only_down[i] = (
@@ -669,19 +985,19 @@ def collect_self_check():
 
     if left_source:
         if get_source_by_name_exists(left_source):
-            passes.append("%s %s source found: %s" % (field_id(1), left_function, left_source))
+            passes.append("Left Click source found: %s" % left_source)
         else:
-            errors.append("%s source missing: %s" % (field_id(1), left_source))
+            errors.append("Left Click source missing: %s" % left_source)
     else:
-        warnings.append("%s %s has no OBS source" % (field_id(1), left_function))
+        warnings.append("Left Click has no OBS source")
 
     if right_source:
         if get_source_by_name_exists(right_source):
-            passes.append("%s %s source found: %s" % (field_id(2), right_function, right_source))
+            passes.append("Right Click source found: %s" % right_source)
         else:
-            errors.append("%s source missing: %s" % (field_id(2), right_source))
+            errors.append("Right Click source missing: %s" % right_source)
     else:
-        warnings.append("%s %s has no OBS source" % (field_id(2), right_function))
+        warnings.append("Right Click has no OBS source")
 
     assigned_source_fields = {}
     passes.append("Active extra programmable inputs: %d" % extra_button_count)
@@ -706,6 +1022,14 @@ def collect_self_check():
                     ))
                 else:
                     warnings.append("%s %s is Modifier Only but no modifier is selected" % (fid, func))
+            elif "CAPS" in set((extra_modifiers[i] or "NONE").split("+")):
+                if extra_keys[i] in ("OBS_HOTKEYS", "UNASSIGNED"):
+                    warnings.append("%s %s uses Caps Lock but has no direct Shortcut Key; choose one, because OBS has no Caps Lock modifier" % (fid, func))
+                elif key_name_to_vk(extra_keys[i]) is None:
+                    warnings.append("%s %s Caps Lock combo uses an unsupported key" % (fid, func))
+                else:
+                    passes.append("%s input: %s + %s (direct Windows polling)" % (
+                        fid, extra_modifiers[i].replace("+", " + ").title(), pretty_key_name(extra_keys[i])))
             elif extra_keys[i] in ("MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN"):
                 if wheel_hook_ready:
                     passes.append("%s input: %s" % (
@@ -776,71 +1100,7 @@ def format_self_check_text(status, lines):
     return "\n".join(body)
 
 
-def show_native_message(title, message, error=False, warning=False):
-    """
-    Launch the result dialog in a separate PowerShell process.
 
-    IMPORTANT:
-    Do NOT call MessageBoxW directly from the OBS Python callback thread.
-    A modal Win32 message box blocks OBS scripting/timers until it is closed.
-    The detached process keeps the dialog independent of OBS.
-    """
-    try:
-        icon = "Information"
-        if error:
-            icon = "Error"
-        elif warning:
-            icon = "Warning"
-
-        title_b64 = base64.b64encode(str(title).encode("utf-8")).decode("ascii")
-        message_b64 = base64.b64encode(str(message).encode("utf-8")).decode("ascii")
-
-        ps_script = (
-            "$ErrorActionPreference = 'SilentlyContinue'\n"
-            "Add-Type -AssemblyName PresentationFramework\n"
-            "$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__TITLE__'))\n"
-            "$message = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__MESSAGE__'))\n"
-            "[System.Windows.MessageBox]::Show($message,$title,"
-            "[System.Windows.MessageBoxButton]::OK,"
-            "[System.Windows.MessageBoxImage]::__ICON__) | Out-Null\n"
-        )
-        ps_script = ps_script.replace("__TITLE__", title_b64)
-        ps_script = ps_script.replace("__MESSAGE__", message_b64)
-        ps_script = ps_script.replace("__ICON__", icon)
-
-        encoded_command = base64.b64encode(
-            ps_script.encode("utf-16le")
-        ).decode("ascii")
-
-        creationflags = 0
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags |= subprocess.CREATE_NO_WINDOW
-        if hasattr(subprocess, "DETACHED_PROCESS"):
-            creationflags |= subprocess.DETACHED_PROCESS
-
-        subprocess.Popen(
-            [
-                "powershell.exe",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-EncodedCommand",
-                encoded_command,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            close_fds=True,
-        )
-
-        return True
-
-    except Exception as exc:
-        log("Could not open non-blocking diagnostic window: %s" % exc)
-        return False
 
 
 def show_diagnostics(status=None, lines=None):
@@ -944,9 +1204,8 @@ def save_profile(name=None, show_error=True):
     ensure_profiles_folder()
     path = profile_file_path(target)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(build_profile_payload(target), handle, indent=2, ensure_ascii=False)
-        log("Saved mouse profile '%s' -> %s" % (target, path))
+        atomic_write_json(path, build_profile_payload(target))
+        log("Saved mouse profile '%s' (%s)" % (target, os.path.basename(path)))
         return True
     except Exception as exc:
         log("Mouse profile save failed: %s" % exc)
@@ -1008,18 +1267,16 @@ def write_payload_to_profile(name, payload):
     path = profile_file_path(name)
     copied = dict(payload)
     copied["schema"] = "controlcast_mouse_profiles"
-    copied["schema_version"] = 2
+    copied["schema_version"] = 3
     copied["profile_name"] = name
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(copied, handle, indent=2, ensure_ascii=False)
+    atomic_write_json(path, copied)
 
 
 def load_profile_payload(name):
     path = profile_file_path(name)
     if not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return load_json_with_backup(path, name)
 
 
 def reset_mouse_states_for_profile_switch():
@@ -1074,6 +1331,11 @@ def apply_profile_payload(payload, settings):
         control = by_field.get(i + 3, {})
         key_mode = str(control.get("key_mode", "OBS_HOTKEYS")) or "OBS_HOTKEYS"
         modifiers = str(control.get("modifiers", "NONE")) or "NONE"
+        if "key_mode" not in control:
+            legacy_mods = legacy_modifier_only_code(control.get("hotkey_bindings", []))
+            if legacy_mods:
+                key_mode = "MODIFIER_ONLY"
+                modifiers = legacy_mods
         obs.obs_data_set_string(settings, "extra_source_%d" % i, str(control.get("source", "")))
         obs.obs_data_set_string(settings, "extra_key_%d" % i, key_mode)
         obs.obs_data_set_string(settings, "extra_mod_%d" % i, modifiers)
@@ -1088,17 +1350,17 @@ def apply_profile_payload(payload, settings):
     obs.obs_data_set_bool(settings, "movement_enabled", bool(movement.get("enabled", False)))
     obs.obs_data_set_string(settings, "movement_scene", str(movement.get("scene", "")))
     obs.obs_data_set_string(settings, "movement_source", str(movement.get("source", "")))
-    obs.obs_data_set_double(settings, "range_x", float(movement.get("range_x", 60)))
-    obs.obs_data_set_double(settings, "sensitivity_x", float(movement.get("sensitivity_x", 0.5)))
-    obs.obs_data_set_double(settings, "range_y", float(movement.get("range_y", 40)))
-    obs.obs_data_set_double(settings, "sensitivity_y", float(movement.get("sensitivity_y", 0.5)))
-    obs.obs_data_set_double(settings, "smoothing", float(movement.get("smoothing", 12)))
-    obs.obs_data_set_double(settings, "return_speed", float(movement.get("return_speed", 4)))
+    obs.obs_data_set_double(settings, "range_x", clamp_finite(movement.get("range_x", 60), 60, 0, 2000))
+    obs.obs_data_set_double(settings, "sensitivity_x", clamp_finite(movement.get("sensitivity_x", 0.5), 0.5, 0.01, 10))
+    obs.obs_data_set_double(settings, "range_y", clamp_finite(movement.get("range_y", 40), 40, 0, 2000))
+    obs.obs_data_set_double(settings, "sensitivity_y", clamp_finite(movement.get("sensitivity_y", 0.5), 0.5, 0.01, 10))
+    obs.obs_data_set_double(settings, "smoothing", clamp_finite(movement.get("smoothing", 12), 12, 1, 60))
+    obs.obs_data_set_double(settings, "return_speed", clamp_finite(movement.get("return_speed", 4), 4, 0, 20))
     obs.obs_data_set_bool(settings, "invert_x", bool(movement.get("invert_x", False)))
     obs.obs_data_set_bool(settings, "invert_y", bool(movement.get("invert_y", False)))
     saved_rest_valid = bool(movement.get("saved_rest_valid", False))
-    saved_rest_x = float(movement.get("saved_rest_x", 0.0))
-    saved_rest_y = float(movement.get("saved_rest_y", 0.0))
+    saved_rest_x = clamp_finite(movement.get("saved_rest_x", 0.0), 0.0, -100000.0, 100000.0)
+    saved_rest_y = clamp_finite(movement.get("saved_rest_y", 0.0), 0.0, -100000.0, 100000.0)
     obs.obs_data_set_bool(settings, "saved_rest_valid", saved_rest_valid)
     obs.obs_data_set_double(settings, "saved_rest_x", saved_rest_x)
     obs.obs_data_set_double(settings, "saved_rest_y", saved_rest_y)
@@ -1123,10 +1385,19 @@ def switch_profile(name, settings):
         return True
 
     save_profile(current_profile, show_error=False)
-    payload = load_profile_payload(target)
-    if payload is None:
-        payload = blank_profile_payload(target)
-        write_payload_to_profile(target, payload)
+    try:
+        payload = load_profile_payload(target)
+        if payload is None:
+            payload = blank_profile_payload(target)
+            write_payload_to_profile(target, payload)
+    except Exception as exc:
+        log("Mouse profile '%s' could not be loaded: %s" % (target, exc))
+        show_native_message(
+            "MouseCast - Profile Load Failed",
+            "Profile '%s' is damaged and has no usable backup.\n\n%s" % (target, exc),
+            error=True,
+        )
+        return False
 
     try:
         profile_operation_guard = True
@@ -1171,6 +1442,13 @@ def execute_profile_action(action, settings):
     if not action:
         return
     new_name = obs.obs_data_get_string(settings, "new_profile_name").strip()
+    # v4.0.3: untick "Confirm / Execute" BEFORE doing anything. Applying a profile
+    # re-runs script_update(); while the box was still ticked, that re-ran this
+    # same action over and over (deleting one profile wiped Default hundreds of
+    # times; Reset opened hundreds of pop-ups). Now each click runs exactly once.
+    obs.obs_data_set_bool(settings, "profile_action_confirm", False)
+    if action in ("CREATE_BLANK", "DUPLICATE"):
+        obs.obs_data_set_string(settings, "new_profile_name", "")
     try:
         profile_operation_guard = True
         if action == "SAVE":
@@ -1217,8 +1495,7 @@ def execute_profile_action(action, settings):
         elif action == "DELETE":
             doomed = current_profile or "Default"
             path = profile_file_path(doomed)
-            if os.path.isfile(path):
-                os.remove(path)
+            remove_profile_files(path)
 
             if doomed == "Default":
                 # Default is the permanent fallback name. Deleting it means:
@@ -1434,6 +1711,18 @@ def add_modifier_list(props, key, label):
         ("Win/Cmd + Ctrl", "COMMAND+CTRL"),
         ("Win/Cmd + Shift", "COMMAND+SHIFT"),
         ("Win/Cmd + Alt", "COMMAND+ALT"),
+        ("Caps Lock", "CAPS"),
+        ("Ctrl + Caps Lock", "CTRL+CAPS"),
+        ("Shift + Caps Lock", "SHIFT+CAPS"),
+        ("Alt + Caps Lock", "ALT+CAPS"),
+        ("Ctrl + Shift + Caps Lock", "CTRL+SHIFT+CAPS"),
+        ("Ctrl + Alt + Caps Lock", "CTRL+ALT+CAPS"),
+        ("Shift + Alt + Caps Lock", "SHIFT+ALT+CAPS"),
+        ("Ctrl + Shift + Alt + Caps Lock", "CTRL+SHIFT+ALT+CAPS"),
+        ("Win/Cmd + Caps Lock", "COMMAND+CAPS"),
+        ("Win/Cmd + Ctrl + Caps Lock", "COMMAND+CTRL+CAPS"),
+        ("Win/Cmd + Shift + Caps Lock", "COMMAND+SHIFT+CAPS"),
+        ("Win/Cmd + Alt + Caps Lock", "COMMAND+ALT+CAPS"),
     ]
     for display, value in choices:
         obs.obs_property_list_add_string(prop, display, value)
@@ -1600,11 +1889,11 @@ def script_defaults(settings):
 
     obs.obs_data_set_default_string(settings, "ui_extra_header", "[ EXTRA INPUTS ]")
     for i in range(EXTRA_BUTTONS):
-        slot = i + 3
+        # v4.0.3: heading now matches the field labels ([01]-[20]).
         obs.obs_data_set_default_string(
             settings,
             "ui_extra_divider_%d" % i,
-            "[ %02d ] INPUT" % slot,
+            "[ %02d ] EXTRA INPUT" % (i + 1),
         )
         obs.obs_data_set_default_string(settings, "extra_source_%d" % i, "")
         obs.obs_data_set_default_string(settings, "extra_key_%d" % i, "OBS_HOTKEYS")
@@ -1648,11 +1937,15 @@ def script_update(settings):
     global saved_rest_x, saved_rest_y, saved_rest_valid, startup_restored
     global movement_origin_x, movement_origin_y, movement_origin_valid
 
+    global forced_display_mode, group_check_until
+
     previous_movement_enabled = movement_enabled
-    previous_master_enabled = master_enabled
 
     if profile_operation_guard:
         return
+
+    forced_display_mode = None
+    group_check_until = 0.0
 
     obs.obs_data_set_string(
         settings,
@@ -1730,16 +2023,6 @@ def script_update(settings):
     for name in old_extra - set(name for name in extra_sources if name):
         if name not in {left_source, right_source}:
             set_source_visibility(name, False)
-
-    left_source_saved = normalize_source_name(obs.obs_data_get_string(settings, "left_source"))
-    right_source_saved = normalize_source_name(obs.obs_data_get_string(settings, "right_source"))
-
-    left_function = left_source_saved if left_source_saved else "Left Click"
-    right_function = right_source_saved if right_source_saved else "Right Click"
-
-    for i in range(EXTRA_BUTTONS):
-        saved_name = normalize_source_name(obs.obs_data_get_string(settings, "extra_source_%d" % i))
-        extra_functions[i] = saved_name if saved_name else "Extra Mouse Button %d" % (i + 1)
 
     movement_enabled = obs.obs_data_get_bool(settings, "movement_enabled")
     movement_scene = obs.obs_data_get_string(settings, "movement_scene")
@@ -1820,6 +2103,7 @@ def script_update(settings):
 
     startup_restored = False
     refresh_extra_hotkey_descriptions()
+    sync_wheel_hook()
 
     if not master_enabled:
         hide_all_indicator_sources()
@@ -2057,7 +2341,14 @@ def poll_movement():
 
     # Never move a loose image/source. The configured movement target must be
     # an OBS Group so child button graphics retain their exact local positions.
-    if not movement_group_is_valid():
+    # v4.0.3: the full check runs at most twice a second; every individual move
+    # below still refuses anything that is not a Group (see with_movement_item).
+    global group_check_until, group_check_ok
+    now_check = time.monotonic()
+    if now_check >= group_check_until:
+        group_check_ok = movement_group_is_valid()
+        group_check_until = now_check + 0.5
+    if not group_check_ok:
         return
 
     # A permanent rest point is required before movement is permitted. The
@@ -2072,8 +2363,6 @@ def poll_movement():
         startup_restored = True
 
     if not movement_origin_valid:
-        movement_origin_x_local = saved_rest_x
-        movement_origin_y_local = saved_rest_y
         # restore_saved_rest_position normally establishes these globals. If a
         # settings refresh cleared them, restore again rather than guessing.
         if not restore_saved_rest_position():
@@ -2220,24 +2509,38 @@ def set_source_visibility(source_name, visible):
 
 
 def poll_mouse_buttons():
-    global left_down, right_down, movement_fault
+    global left_down, right_down, movement_fault, forced_display_mode
 
     if not master_enabled:
+        consume_wheel_events()  # drop wheel clicks so they don't flash later
         if left_down or right_down:
             left_down = False
             right_down = False
-        hide_all_indicator_sources()
+        # v4.0.3: hide once when switched off, instead of sweeping every
+        # scene 120 times a second.
+        if forced_display_mode != "off":
+            hide_all_indicator_sources()
+            forced_display_mode = "off"
         return
 
     if setup_preview_enabled:
         # Setup mode intentionally overrides reactive visibility so users can
-        # arrange assigned images/groups without fighting the 60 Hz input poller.
+        # arrange assigned images/groups. v4.0.3: shown once on entry, not
+        # re-forced every frame.
+        consume_wheel_events()
         left_down = False
         right_down = False
         for i in range(EXTRA_BUTTONS):
             extra_down[i] = False
-        show_all_indicator_sources()
+        if forced_display_mode != "preview":
+            show_all_indicator_sources()
+            forced_display_mode = "preview"
         return
+
+    if forced_display_mode is not None:
+        # Back to normal operation: re-apply the live input state once.
+        forced_display_mode = None
+        update_click_visibility()
 
     try:
         poll_extra_modifier_only_inputs()
@@ -2300,6 +2603,7 @@ def script_load(settings):
     global movement_origin_x, movement_origin_y, movement_origin_valid
     global master_enabled, current_profile, startup_self_check
     global left_function, right_function, script_settings_ref
+    global extra_button_count
 
     print("--- %s loaded from %s ---" % (VERSION, __file__))
     ensure_profiles_folder()
@@ -2335,8 +2639,8 @@ def script_load(settings):
 
     if user32 is None:
         log("ERROR: Windows user32 API is unavailable.")
-    else:
-        start_wheel_hook()
+    # v4.0.3: the wheel listener is started by sync_wheel_hook() (via the
+    # profile restore below) only when a slot uses Mouse Wheel Up/Down.
 
     left_down = False
     right_down = False

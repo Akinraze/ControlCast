@@ -2,14 +2,14 @@ import obspython as obs
 import json
 import os
 import re
-import base64
-import subprocess
 import ctypes
+import threading
+import time
 
 
 MAX_BUTTONS = 65
 INPUT_COUNT_CHOICES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
-VERSION = "InputCast_Windows_v4_0_1"
+VERSION = "InputCast_Windows_v4_0_3"
 PROFILE_DIRNAME = "ControlCast_profiles"
 LEGACY_PROFILE_FILENAME = "push_to_enable_30_profile.json"
 
@@ -61,7 +61,185 @@ VK_CAPITAL = 0x14
 # ------------------------------
 
 def log(message):
-    print("[InputCast] " + str(message))
+    print("[InputCast] " + scrub_text(message))
+
+
+# ------------------------------
+# v4.0.2 safety helpers
+# ------------------------------
+# PRIVACY NOTE: ControlCast reads only the inputs you configure (mouse buttons,
+# the specific keys / modifiers you assign, and mouse-wheel events). It does not
+# record, store or transmit keystrokes, cursor paths or window contents, and it
+# contains no network code.
+
+_WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % n for n in range(1, 10)}
+    | {"LPT%d" % n for n in range(1, 10)}
+)
+
+
+def scrub_text(text):
+    """Replace the Windows user-profile folder so logs and popups are safe to share."""
+    try:
+        text = str(text)
+        home = os.path.expanduser("~")
+        if home and home != "~" and len(home) > 3:
+            for variant in {home, home.replace("\\", "/")}:
+                text = re.sub(re.escape(variant), "%USERPROFILE%", text, flags=re.IGNORECASE)
+        return text
+    except Exception:
+        return str(text)
+
+
+def clamp_finite(value, default, low, high):
+    """float(value) limited to [low, high]; NaN, infinity and junk fall back to default."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if number != number or number in (float("inf"), float("-inf")):
+        return float(default)
+    return max(float(low), min(float(high), number))
+
+
+def _is_valid_json_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return True
+    except Exception:
+        return False
+
+
+def atomic_write_json(path, payload):
+    """Write JSON so a crash or power loss can never leave a half-written profile.
+
+    Data goes to a temp file first, the previous good file is kept as .bak, and the
+    temp file then replaces the real one in a single step.
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+
+    if os.path.isfile(path) and _is_valid_json_file(path):
+        try:
+            with open(path, "rb") as src, open(path + ".bak", "wb") as dst:
+                dst.write(src.read())
+        except OSError:
+            pass
+
+    last_error = None
+    for _attempt in range(5):  # antivirus scanners can briefly lock files on Windows
+        try:
+            os.replace(tmp_path, path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise last_error
+
+
+def read_json_file(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_json_with_backup(path, label):
+    """Read a profile; if it is corrupt, fall back to the last good .bak copy."""
+    try:
+        return read_json_file(path)
+    except (ValueError, OSError) as exc:
+        log("Profile '%s' could not be read (%s)." % (label, exc))
+        backup = path + ".bak"
+        if os.path.isfile(backup):
+            payload = read_json_file(backup)
+            log("Recovered profile '%s' from its backup copy." % label)
+            return payload
+        raise
+
+
+def remove_profile_files(path):
+    """Delete a profile and its .bak / .tmp companions so deleted stays deleted."""
+    for candidate in (path, path + ".bak", path + ".tmp"):
+        if os.path.isfile(candidate):
+            try:
+                os.remove(candidate)
+            except OSError as exc:
+                log("Could not remove %s: %s" % (os.path.basename(candidate), exc))
+
+
+def legacy_modifier_only_code(bindings):
+    """Older profiles stored a modifier-only input as an OBS hotkey with no key.
+
+    OBS can never fire those, so convert them to the polled MODIFIER_ONLY mode.
+    Returns a modifier code such as "SHIFT" or "CTRL+ALT", or None.
+    """
+    try:
+        for binding in bindings or []:
+            key = str(binding.get("key", "") or "OBS_KEY_NONE")
+            if key not in ("OBS_KEY_NONE", ""):
+                continue
+            mods = []
+            if binding.get("command"):
+                mods.append("COMMAND")
+            if binding.get("control"):
+                mods.append("CTRL")
+            if binding.get("shift"):
+                mods.append("SHIFT")
+            if binding.get("alt"):
+                mods.append("ALT")
+            if mods:
+                return "+".join(mods)
+    except Exception:
+        pass
+    return None
+
+
+MB_OK = 0x00000000
+MB_ICONERROR = 0x00000010
+MB_ICONWARNING = 0x00000030
+MB_ICONINFORMATION = 0x00000040
+MB_SETFOREGROUND = 0x00010000
+MB_TOPMOST = 0x00040000
+
+
+def show_native_message(title, message, error=False, warning=False):
+    """Show a Windows message box without blocking OBS and without launching any program.
+
+    The dialog lives on its own short-lived thread, so OBS timers keep running while
+    it is open. (v4.0.1 launched a hidden, encoded PowerShell process instead, which
+    antivirus tools commonly flag.)
+    """
+    if user32 is None:
+        return False
+    try:
+        flags = MB_OK | MB_SETFOREGROUND | MB_TOPMOST
+        if error:
+            flags |= MB_ICONERROR
+        elif warning:
+            flags |= MB_ICONWARNING
+        else:
+            flags |= MB_ICONINFORMATION
+        safe_title = scrub_text(title)
+        safe_message = scrub_text(message)
+
+        def _show():
+            try:
+                user32.MessageBoxW(None, safe_message, safe_title, flags)
+            except Exception as exc:
+                log("Diagnostic window failed: %s" % exc)
+
+        threading.Thread(target=_show, name="ControlCastMessageBox", daemon=True).start()
+        return True
+    except Exception as exc:
+        log("Could not show diagnostic window: %s" % exc)
+        return False
 
 
 def field_id(index):
@@ -84,8 +262,11 @@ def legacy_profile_path():
 
 
 def safe_profile_filename(name):
-    cleaned = re.sub(r'[<>:"/\\|?*]+', "_", (name or "").strip())
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (name or "").strip())
     cleaned = cleaned.rstrip(" .")
+    if cleaned.split(".")[0].strip().upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned  # CON, NUL, COM1 ... are reserved device names on Windows
+    cleaned = cleaned[:100].rstrip(" .")
     return cleaned or "Default"
 
 
@@ -810,9 +991,8 @@ def save_profile(name=None, show_error=True):
     ensure_profiles_folder()
     path = profile_path(target)
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(build_profile_payload(target), handle, indent=2, ensure_ascii=False)
-        log("Saved profile '%s' -> %s" % (target, path))
+        atomic_write_json(path, build_profile_payload(target))
+        log("Saved profile '%s' (%s)" % (target, os.path.basename(path)))
         return True
     except Exception as exc:
         log("Profile save failed: %s" % exc)
@@ -854,16 +1034,14 @@ def write_payload_to_profile(name, payload):
     path = profile_path(name)
     payload = dict(payload)
     payload["profile_name"] = name
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    atomic_write_json(path, payload)
 
 
 def load_profile_payload(name):
     path = profile_path(name)
     if not os.path.isfile(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return load_json_with_backup(path, name)
 
 
 def apply_profile_payload(payload, settings):
@@ -899,6 +1077,11 @@ def apply_profile_payload(payload, settings):
         invert = bool(entry.get("invert", False))
         key_mode = str(entry.get("key_mode", "OBS_HOTKEYS")) or "OBS_HOTKEYS"
         modifiers = str(entry.get("modifiers", "NONE")) or "NONE"
+        if "key_mode" not in entry:
+            legacy_mods = legacy_modifier_only_code(entry.get("hotkey_bindings", []))
+            if legacy_mods:
+                key_mode = "MODIFIER_ONLY"
+                modifiers = legacy_mods
 
         button_sources[i] = source
         button_inverts[i] = invert
@@ -935,11 +1118,20 @@ def switch_profile(name, settings):
     # Save outgoing profile first so live switches never discard work.
     save_profile(current_profile, show_error=False)
 
-    payload = load_profile_payload(target)
-    if payload is None:
-        # A profile listed in UI should normally exist; if not, create blank.
-        payload = blank_profile_payload(target)
-        write_payload_to_profile(target, payload)
+    try:
+        payload = load_profile_payload(target)
+        if payload is None:
+            # A profile listed in UI should normally exist; if not, create blank.
+            payload = blank_profile_payload(target)
+            write_payload_to_profile(target, payload)
+    except Exception as exc:
+        log("Profile '%s' could not be loaded: %s" % (target, exc))
+        show_native_message(
+            "InputCast - Profile Load Failed",
+            "Profile '%s' is damaged and has no usable backup.\n\n%s" % (target, exc),
+            error=True,
+        )
+        return False
 
     try:
         profile_operation_guard = True
@@ -994,44 +1186,7 @@ def source_exists(name):
     return True
 
 
-def show_native_message(title, message, error=False, warning=False):
-    """Detached Windows popup so OBS scripting never blocks."""
-    try:
-        icon = "Information"
-        if error:
-            icon = "Error"
-        elif warning:
-            icon = "Warning"
-        title_b64 = base64.b64encode(str(title).encode("utf-8")).decode("ascii")
-        message_b64 = base64.b64encode(str(message).encode("utf-8")).decode("ascii")
-        ps_script = (
-            "$ErrorActionPreference = 'SilentlyContinue'\n"
-            "Add-Type -AssemblyName PresentationFramework\n"
-            "$title = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__TITLE__'))\n"
-            "$message = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__MESSAGE__'))\n"
-            "[System.Windows.MessageBox]::Show($message,$title,"
-            "[System.Windows.MessageBoxButton]::OK,"
-            "[System.Windows.MessageBoxImage]::__ICON__) | Out-Null\n"
-        )
-        ps_script = ps_script.replace("__TITLE__", title_b64).replace("__MESSAGE__", message_b64).replace("__ICON__", icon)
-        encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-        creationflags = 0
-        if hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags |= subprocess.CREATE_NO_WINDOW
-        if hasattr(subprocess, "DETACHED_PROCESS"):
-            creationflags |= subprocess.DETACHED_PROCESS
-        subprocess.Popen(
-            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            close_fds=True,
-        )
-        return True
-    except Exception as exc:
-        log("Could not show diagnostic window: %s" % exc)
-        return False
+
 
 
 def collect_self_check():
@@ -1071,6 +1226,17 @@ def collect_self_check():
                 passes.append("%s input: %s" % (fid, describe_bindings(bindings)))
             else:
                 warnings.append("%s %s has no hotkey binding" % (fid, src))
+
+    # v4.0.3: one OBS Source used by several slots must use the same Invert
+    # setting; otherwise the last slot silently decides how it behaves.
+    invert_by_source = {}
+    for i in range(input_count):
+        if button_sources[i]:
+            invert_by_source.setdefault(button_sources[i], []).append((field_id(i + 1), bool(button_inverts[i])))
+    for src, slots in invert_by_source.items():
+        if len(set(inv for _fid, inv in slots)) > 1:
+            warnings.append("%s is used by %s with different Invert settings; set them all the same" % (
+                src, ", ".join(fid for fid, _inv in slots)))
 
     if configured == 0:
         warnings.append("No active input slots have OBS Sources assigned")
@@ -1183,6 +1349,10 @@ def execute_profile_action(action, settings):
         return
 
     new_name = obs.obs_data_get_string(settings, "new_profile_name").strip()
+    # v4.0.3: untick "Confirm / Execute" before acting, so a settings refresh
+    # during the action can never run the same action a second time.
+    obs.obs_data_set_bool(settings, "execute_profile_action", False)
+    obs.obs_data_set_string(settings, "new_profile_name", "")
     try:
         profile_operation_guard = True
 
@@ -1219,8 +1389,7 @@ def execute_profile_action(action, settings):
         elif action == "DELETE":
             doomed = current_profile
             path = profile_path(doomed)
-            if os.path.isfile(path):
-                os.remove(path)
+            remove_profile_files(path)
 
             current_profile = "Default"
             obs.obs_data_set_string(settings, "selected_profile", "Default")
