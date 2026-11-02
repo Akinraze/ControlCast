@@ -88,7 +88,7 @@ There are no required layouts, image styles, naming conventions, or asset folder
 
 ## Current Modules
 
-> **Latest Windows update: v4.0.4**
+> **Latest Windows update: v4.0.4** — [all files on the v4.0.4 release page](https://github.com/Akinraze/ControlCast/releases/tag/v4.0.4)
 >
 > - **Both (fix):** OBS could crash while starting when MouseCast and InputCast were both loaded (crash log: `add_python_obs_callback`). The scripts now start their input checks only after OBS has finished loading, and pause them while hotkeys are being set up. Your profiles and hotkeys are unchanged; the inputs simply start working a moment after OBS opens.
 > - **How to update:** in OBS open **Tools → Scripts**, select the old v4.0.3 script, click **–** (remove), then click **+** and add the v4.0.4 file. Your profiles are kept (they live in the `ControlCast_profiles` folder next to the script, so put the new file in the same folder as the old one).
@@ -139,7 +139,7 @@ It supports:
 
 **Windows production build**
 
-`MouseCast_Windows_v4_0_4.py`
+`MouseCast_Windows_v4_0_4.py` — **[Download](https://github.com/Akinraze/ControlCast/releases/download/v4.0.4/MouseCast_Windows_v4_0_4.py)**
 
 **macOS Community Test v4.0.3 RC2 — ⚠️ UNTESTED BY TESTERS**
 
@@ -188,7 +188,7 @@ It supports:
 
 **Windows production build**
 
-`InputCast_Windows_v4_0_4.py`
+`InputCast_Windows_v4_0_4.py` — **[Download](https://github.com/Akinraze/ControlCast/releases/download/v4.0.4/InputCast_Windows_v4_0_4.py)**
 
 **macOS Community Test v4.0.3 RC2 — ⚠️ UNTESTED BY TESTERS**
 
