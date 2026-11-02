@@ -88,7 +88,12 @@ There are no required layouts, image styles, naming conventions, or asset folder
 
 ## Current Modules
 
-> **Latest Windows update: v4.0.3**
+> **Latest Windows update: v4.0.4**
+>
+> - **Both (fix):** OBS could crash while starting when MouseCast and InputCast were both loaded (crash log: `add_python_obs_callback`). The scripts now start their input checks only after OBS has finished loading, and pause them while hotkeys are being set up. Your profiles and hotkeys are unchanged; the inputs simply start working a moment after OBS opens.
+> - **How to update:** in OBS open **Tools → Scripts**, select the old v4.0.3 script, click **–** (remove), then click **+** and add the v4.0.4 file. Your profiles are kept (they live in the `ControlCast_profiles` folder next to the script, so put the new file in the same folder as the old one).
+>
+> **v4.0.3**
 >
 > - **MouseCast:** fixed a profile bug — deleting a profile could also wipe your **Default** profile, and "Reset selected profile to blank" could open hundreds of pop-up windows. Each profile action now runs exactly once.
 > - **MouseCast:** much lighter while switched off or in Setup / Preview Mode (it no longer re-scans every scene 120 times a second).
@@ -102,7 +107,7 @@ There are no required layouts, image styles, naming conventions, or asset folder
 >
 > **macOS v4.0.3 RC2 and Linux v4.0.3 RC1 are UNTESTED BY TESTERS.** No tester has run them on a real Mac or a real Linux PC yet. They carry the same profile fixes as Windows v4.0.3, but expect problems and please report what you find.
 
-### MouseCast v4.0.3
+### MouseCast v4.0.4 (Windows) / v4.0.3 (macOS, Linux)
 
 **MouseCast** is the dedicated mouse-visualization module.
 
@@ -134,7 +139,7 @@ It supports:
 
 **Windows production build**
 
-`MouseCast_Windows_v4_0_3.py`
+`MouseCast_Windows_v4_0_4.py`
 
 **macOS Community Test v4.0.3 RC2 — ⚠️ UNTESTED BY TESTERS**
 
@@ -146,7 +151,7 @@ It supports:
 
 ---
 
-### InputCast v4.0.3
+### InputCast v4.0.4 (Windows) / v4.0.3 (macOS, Linux)
 
 **InputCast** is the general reactive-input module.
 
@@ -183,7 +188,7 @@ It supports:
 
 **Windows production build**
 
-`InputCast_Windows_v4_0_3.py`
+`InputCast_Windows_v4_0_4.py`
 
 **macOS Community Test v4.0.3 RC2 — ⚠️ UNTESTED BY TESTERS**
 
@@ -199,7 +204,7 @@ It supports:
 
 | Platform | MouseCast | InputCast | Status |
 | --- | --- | --- | --- |
-| Windows | `MouseCast_Windows_v4_0_3.py` | `InputCast_Windows_v4_0_3.py` | **Production** |
+| Windows | `MouseCast_Windows_v4_0_4.py` | `InputCast_Windows_v4_0_4.py` | **Production** (v4.0.4) |
 | macOS | `MouseCast_macOS_v4_0_3_RC2.py` | `InputCast_macOS_v4_0_3_RC2.py` | **⚠️ UNTESTED BY TESTERS** — Community Test RC2 |
 | Linux (X11) | `MouseCast_Linux_v4_0_3_RC1.py` | `InputCast_Linux_v4_0_3_RC1.py` | **⚠️ UNTESTED BY TESTERS** — Community Test RC1 |
 
@@ -294,8 +299,8 @@ Choose the ControlCast module for your operating system.
 
 For Windows:
 
-- `MouseCast_Windows_v4_0_3.py`
-- `InputCast_Windows_v4_0_3.py`
+- `MouseCast_Windows_v4_0_4.py`
+- `InputCast_Windows_v4_0_4.py`
 
 For macOS community testing (**UNTESTED BY TESTERS**):
 

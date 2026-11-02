@@ -22,7 +22,7 @@ import re
 import threading
 from ctypes import wintypes
 
-VERSION = "MouseCast_Windows_v4_0_3"
+VERSION = "MouseCast_Windows_v4_0_4"
 POLL_MS = 16  # ~60 Hz; more than enough for OBS animation and much safer than 10 ms
 MOVEMENT_STARTUP_DELAY = 1.5  # seconds; lets OBS finish restoring scenes before movement begins
 
@@ -535,6 +535,55 @@ def show_native_message(title, message, error=False, warning=False):
     except Exception as exc:
         log("Could not show diagnostic window: %s" % exc)
         return False
+
+
+# ------------------------------
+# v4.0.4: start-up crash fix
+# ------------------------------
+# OBS keeps ONE "which Python script is running" marker for all scripts. A script
+# timer that fires while another script is still loading can clear that marker in
+# the middle of a hotkey registration, and OBS then crashes while starting
+# ("add_python_obs_callback" in the crash log). So the polling timers start only
+# after OBS has finished loading (or when the Scripts window shows this script),
+# and they pause while this script registers hotkeys.
+timers_running = False
+self_check_scheduled = False
+
+
+def start_timers():
+    global timers_running
+    if timers_running or not loaded:
+        return
+    timers_running = True
+    try:
+        obs.timer_add(poll_mouse_buttons, POLL_MS)
+    except Exception as exc:
+        timers_running = False
+        log("Could not start input polling: %s" % exc)
+    global self_check_scheduled
+    if self_check_scheduled:
+        return
+    self_check_scheduled = True  # once per load, not after every pause
+    try:
+        obs.timer_add(run_startup_self_check_once, 2200)
+    except Exception as exc:
+        log("Could not schedule startup self-check: %s" % exc)
+
+
+def stop_timers():
+    global timers_running
+    if not timers_running:
+        return
+    timers_running = False
+    try:
+        obs.timer_remove(poll_mouse_buttons)
+    except Exception:
+        pass
+
+
+def on_frontend_event(event):
+    if event in (obs.OBS_FRONTEND_EVENT_FINISHED_LOADING, obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED):
+        start_timers()
 
 
 def script_description():
@@ -1789,6 +1838,7 @@ def add_source_list(props, key, label):
 
 
 def script_properties():
+    start_timers()
     props = obs.obs_properties_create()
 
     # OBS Python properties cannot safely use modified/button callbacks in this
@@ -2597,6 +2647,8 @@ def run_startup_self_check_once():
 
 
 def script_load(settings):
+    global self_check_scheduled
+    self_check_scheduled = False
     global loaded, left_down, right_down
     global movement_enabled, movement_fault, movement_start_after
     global saved_rest_x, saved_rest_y, saved_rest_valid, startup_restored
@@ -2696,13 +2748,14 @@ def script_load(settings):
     if right_source:
         set_source_visibility(right_source, False)
 
-    obs.timer_add(poll_mouse_buttons, POLL_MS)
     try:
-        obs.timer_add(run_startup_self_check_once, 2200)
+        obs.obs_frontend_add_event_callback(on_frontend_event)
     except Exception as exc:
-        log("Could not schedule startup self-check: %s" % exc)
+        log("Could not watch OBS loading; starting input polling now: %s" % exc)
+        start_timers()
 
 def script_unload():
+    stop_timers()
     global loaded, left_down, right_down, script_settings_ref
 
     stop_wheel_hook()
