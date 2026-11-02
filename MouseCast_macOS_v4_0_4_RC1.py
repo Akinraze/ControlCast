@@ -1,5 +1,5 @@
 # OBS Studio Mouse Click Overlay
-# Linux (X11) left/right indicators, twenty programmable extra inputs, named profiles, and bounded mouse movement.
+# macOS left/right indicators, twenty programmable extra inputs, named profiles, and bounded mouse movement.
 # Requires OBS's obspython and a Python runtime compatible with the installed OBS.
 # Uses Python's standard library; no web server, pynput or AutoHotkey required.
 #
@@ -19,14 +19,17 @@ import time
 import json
 import os
 import re
-import shutil
 import subprocess
 import threading
 
-VERSION = "MouseCast_Linux_v4_0_3_RC1"
+VERSION = "MouseCast_macOS_v4_0_4_RC1"
 POLL_MS = 16  # ~60 Hz; more than enough for OBS animation and much safer than 10 ms
 MOVEMENT_STARTUP_DELAY = 1.5  # seconds; lets OBS finish restoring scenes before movement begins
 
+# macOS CoreGraphics mouse input constants.
+CG_EVENT_SOURCE_STATE_COMBINED_SESSION = 0
+CG_MOUSE_BUTTON_LEFT = 0
+CG_MOUSE_BUTTON_RIGHT = 1
 
 left_source = None
 right_source = None
@@ -106,148 +109,49 @@ extra_keys = ["OBS_HOTKEYS"] * EXTRA_BUTTONS
 extra_modifiers = ["NONE"] * EXTRA_BUTTONS
 modifier_only_down = [False] * EXTRA_BUTTONS
 
-# ------------------------------
-# Linux X11 input layer
-# ------------------------------
-# Reads the mouse buttons, cursor position and modifier keys from the X11 display
-# server (libX11, part of every X11 desktop). Nothing is recorded, stored or sent
-# anywhere. On Wayland desktops the X11 server only sees XWayland windows, so
-# detection is limited there (the startup self-check says so).
-
-X11_SHIFT_L = 0xFFE1
-X11_SHIFT_R = 0xFFE2
-X11_CONTROL_L = 0xFFE3
-X11_CONTROL_R = 0xFFE4
-X11_ALT_L = 0xFFE9
-X11_ALT_R = 0xFFEA
-X11_SUPER_L = 0xFFEB
-X11_SUPER_R = 0xFFEC
-
-X11_BUTTON1_MASK = 1 << 8   # left button
-X11_BUTTON3_MASK = 1 << 10  # right button
-
-x11 = None
-x11_display = None
-x11_root = 0
-x11_failed = False
-_x11_keycodes = {}
-_x11_keymap = None
-_x11_keymap_time = 0.0
+# macOS virtual key codes (left/right variants where applicable).
+MAC_KEY_SHIFT_LEFT = 56
+MAC_KEY_SHIFT_RIGHT = 60
+MAC_KEY_CONTROL_LEFT = 59
+MAC_KEY_CONTROL_RIGHT = 62
+MAC_KEY_OPTION_LEFT = 58
+MAC_KEY_OPTION_RIGHT = 61
+MAC_KEY_COMMAND_LEFT = 55
+MAC_KEY_COMMAND_RIGHT = 54
 
 
-def is_wayland_session():
-    return (
-        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
-        or bool(os.environ.get("WAYLAND_DISPLAY"))
+class CGPoint(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_double),
+        ("y", ctypes.c_double),
+    ]
+
+
+cg = None
+cf = None
+try:
+    cg = ctypes.CDLL(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
     )
-
-
-def x11_ready():
-    """Open the X11 connection on first use. Returns True when input can be read."""
-    global x11, x11_display, x11_root, x11_failed
-    if x11_display:
-        return True
-    if x11_failed:
-        return False
-    try:
-        if x11 is None:
-            lib = None
-            for name in ("libX11.so.6", "libX11.so"):
-                try:
-                    lib = ctypes.CDLL(name)
-                    break
-                except OSError:
-                    continue
-            if lib is None:
-                raise OSError("libX11 not found")
-            lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
-            lib.XOpenDisplay.restype = ctypes.c_void_p
-            lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
-            lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-            lib.XDefaultRootWindow.restype = ctypes.c_ulong
-            lib.XQueryPointer.argtypes = [
-                ctypes.c_void_p, ctypes.c_ulong,
-                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
-                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-                ctypes.POINTER(ctypes.c_uint),
-            ]
-            lib.XQueryPointer.restype = ctypes.c_int
-            lib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
-            lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-            lib.XKeysymToKeycode.restype = ctypes.c_ubyte
-            x11 = lib
-        display = x11.XOpenDisplay(None)
-        if not display:
-            raise OSError("no X11 display (is DISPLAY set?)")
-        x11_display = display
-        x11_root = x11.XDefaultRootWindow(display)
-        _x11_keycodes.clear()
-        return True
-    except Exception as exc:
-        x11_failed = True
-        log("X11 input unavailable: %s" % exc)
-        return False
-
-
-def x11_close():
-    global x11_display, x11_failed
-    if x11 is not None and x11_display:
-        try:
-            x11.XCloseDisplay(x11_display)
-        except Exception:
-            pass
-    x11_display = None
-    x11_failed = False
-
-
-def x11_pointer_state():
-    """Return (x, y, button_mask) for the pointer, or None."""
-    if not x11_ready():
-        return None
-    try:
-        root = ctypes.c_ulong()
-        child = ctypes.c_ulong()
-        rx, ry, wx, wy = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
-        mask = ctypes.c_uint()
-        if not x11.XQueryPointer(
-            x11_display, x11_root,
-            ctypes.byref(root), ctypes.byref(child),
-            ctypes.byref(rx), ctypes.byref(ry),
-            ctypes.byref(wx), ctypes.byref(wy),
-            ctypes.byref(mask),
-        ):
-            return None
-        return (float(rx.value), float(ry.value), int(mask.value))
-    except Exception:
-        return None
-
-
-def is_x11_key_down(keysym):
-    """True while the key for this X11 keysym is physically held."""
-    global _x11_keymap, _x11_keymap_time
-    if not x11_ready():
-        return False
-    try:
-        keycode = _x11_keycodes.get(keysym)
-        if keycode is None:
-            keycode = int(x11.XKeysymToKeycode(x11_display, keysym))
-            _x11_keycodes[keysym] = keycode
-        if not keycode:
-            return False
-        now = time.monotonic()
-        if _x11_keymap is None or now - _x11_keymap_time > 0.005:
-            buffer = (ctypes.c_char * 32)()
-            x11.XQueryKeymap(x11_display, buffer)
-            _x11_keymap = bytes(buffer.raw)
-            _x11_keymap_time = now
-        return bool(_x11_keymap[keycode // 8] & (1 << (keycode % 8)))
-    except Exception:
-        return False
-
+    cf = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+    cg.CGEventCreate.restype = ctypes.c_void_p
+    cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+    cg.CGEventGetLocation.restype = CGPoint
+    cg.CGEventSourceButtonState.argtypes = [ctypes.c_int32, ctypes.c_uint32]
+    cg.CGEventSourceButtonState.restype = ctypes.c_bool
+    cg.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
+    cg.CGEventSourceKeyState.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+except Exception:
+    cg = None
+    cf = None
 
 # Mouse Wheel Up / Down is a Windows-only feature for now. These placeholders
-# keep the shared code paths working; on Linux the wheel is never listened to.
+# keep the shared code paths working; on macOS the wheel is never listened to.
 WHEEL_PULSE_SECONDS = 0.150
 wheel_hook_thread = None
 wheel_hook_ready = False
@@ -267,7 +171,7 @@ def stop_wheel_hook():
 
 
 def wheel_input_needed():
-    """Mouse Wheel inputs are Windows-only; Linux never starts a listener."""
+    """Mouse Wheel inputs are Windows-only; macOS never starts a listener."""
     return False
 
 
@@ -446,44 +350,87 @@ def legacy_modifier_only_code(bindings):
 
 
 def show_native_message(title, message, error=False, warning=False):
-    """Show a desktop pop-up without blocking OBS.
+    """Open a detached macOS dialog so OBS scripting/timers never block.
 
-    Uses zenity (GNOME and most desktops) or kdialog (KDE) when installed. The
-    text is passed as arguments, never through a shell, so it cannot change what
-    runs. When neither tool exists, the message is still in the Script Log.
+    osascript is Apple's own built-in scripting tool. The title and message are
+    passed as arguments (never pasted into the script text), so their contents
+    cannot change what the dialog does.
     """
-    safe_title = scrub_text(title)
-    safe_message = scrub_text(message)
-    kind = "error" if error else ("warning" if warning else "info")
-    candidates = [
-        ["zenity", "--%s" % kind, "--no-markup", "--title", safe_title, "--text", safe_message],
-        ["kdialog", "--title", safe_title,
-         {"error": "--error", "warning": "--sorry", "info": "--msgbox"}[kind], safe_message],
-    ]
-    for args in candidates:
-        if shutil.which(args[0]) is None:
-            continue
-        try:
-            subprocess.Popen(
-                args,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,
-            )
-            return True
-        except Exception as exc:
-            log("Could not open %s pop-up: %s" % (args[0], exc))
-    log("No pop-up tool (zenity or kdialog) found; see the message above in the Script Log.")
-    return False
+    try:
+        script = (
+            'on run argv\n'
+            'set dialogTitle to item 1 of argv\n'
+            'set dialogMessage to item 2 of argv\n'
+            'display dialog dialogMessage with title dialogTitle buttons {"OK"} default button "OK"\n'
+            'end run'
+        )
+        subprocess.Popen(
+            ["osascript", "-e", script, scrub_text(title), scrub_text(message)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        return True
+    except Exception as exc:
+        log("Could not open macOS diagnostic window: %s" % exc)
+        return False
+
+
+# ------------------------------
+# v4.0.4: start-up crash fix
+# ------------------------------
+# OBS keeps ONE "which Python script is running" marker for all scripts. A script
+# timer that fires while another script is still loading can clear that marker in
+# the middle of a hotkey registration, and OBS then crashes while starting
+# ("add_python_obs_callback" in the crash log). So the polling timers start only
+# after OBS has finished loading (or when the Scripts window shows this script),
+# and they pause while this script registers hotkeys.
+timers_running = False
+self_check_scheduled = False
+
+
+def start_timers():
+    global timers_running, self_check_scheduled
+    if timers_running or not loaded:
+        return
+    timers_running = True
+    try:
+        obs.timer_add(poll_mouse_buttons, POLL_MS)
+    except Exception as exc:
+        timers_running = False
+        log("Could not start input polling: %s" % exc)
+    if self_check_scheduled:
+        return
+    self_check_scheduled = True  # once per load, not after every pause
+    try:
+        obs.timer_add(run_startup_self_check_once, 2200)
+    except Exception as exc:
+        log("Could not schedule startup self-check: %s" % exc)
+
+
+def stop_timers():
+    global timers_running
+    if not timers_running:
+        return
+    timers_running = False
+    try:
+        obs.timer_remove(poll_mouse_buttons)
+    except Exception:
+        pass
+
+
+def on_frontend_event(event):
+    if event in (obs.OBS_FRONTEND_EVENT_FINISHED_LOADING, obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED):
+        start_timers()
 
 
 def script_description():
     return (
         "<b>%s</b><br><br>"
-        "Linux (X11) Community Test build for <b>MouseCast</b> with named mouse profiles and live profile switching.<br>"
-        "<b>UNTESTED BY TESTERS:</b> this Linux build has not been run on a real Linux PC by any tester. It targets X11 desktops; on Wayland, mouse and modifier detection is limited. Expect problems and please report results on GitHub Issues.<br><br>"
+        "macOS Community Test build for <b>MouseCast</b> with named mouse profiles and live profile switching.<br>"
+        "<b>UNTESTED BY TESTERS:</b> this macOS build has not been run on a real Mac by any tester. Expect problems and please report results on GitHub Issues.<br><br>"
         "Switch profiles while OBS is running or recording; no OBS restart is required.<br><b>Module:</b> MouseCast — physical mouse clicks, programmable mouse inputs, and reactive mouse movement visuals.<br><br>"
         "<b>Mouse inputs:</b> physical Left/Right Click plus a user-selected 0-20 additional programmable inputs "
         "([01]-[20] additional inputs) for mice with large side-button layouts, keyboard shortcuts, modifiers, or OBS hotkeys. "
@@ -503,7 +450,7 @@ def script_description():
         "After profile/settings changes it re-arms from the current physical cursor position before movement resumes.<br>"
         "Turning movement OFF, arranging the mouse, then ON saves that position as the profile's "
         "permanent rest position.<br><br>"
-        "Startup self-check logs PASS silently and opens a desktop pop-up (zenity or kdialog, if installed) only for warnings/errors.<br>"
+        "Startup self-check logs PASS silently and opens a detached macOS dialog only for warnings/errors.<br>"
         "<b>Safety:</b> no Python property-button callbacks are registered."
     ) % VERSION
 
@@ -712,13 +659,19 @@ def apply_extra_ui_binding(index):
     load_extra_hotkey_binding(index, binding_from_ui(key_name, extra_modifiers[index]))
 
 
-def is_vk_down(vk_code):
-    """Windows key codes are not used on Linux."""
-    return False
+def is_mac_key_down(key_code):
+    if cg is None:
+        return False
+    try:
+        return bool(cg.CGEventSourceKeyState(
+            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(key_code)
+        ))
+    except Exception:
+        return False
 
 
 def key_name_to_vk(key_name):
-    """Caps Lock key combinations are Windows-only; nothing is mapped on Linux."""
+    """Caps Lock key combinations are Windows-only; nothing is mapped on macOS."""
     return None
 
 
@@ -734,13 +687,13 @@ def modifier_combo_is_down(modifier_code):
         return False
     checks = []
     if "SHIFT" in mods:
-        checks.append(is_x11_key_down(X11_SHIFT_L) or is_x11_key_down(X11_SHIFT_R))
+        checks.append(is_mac_key_down(MAC_KEY_SHIFT_LEFT) or is_mac_key_down(MAC_KEY_SHIFT_RIGHT))
     if "CTRL" in mods:
-        checks.append(is_x11_key_down(X11_CONTROL_L) or is_x11_key_down(X11_CONTROL_R))
+        checks.append(is_mac_key_down(MAC_KEY_CONTROL_LEFT) or is_mac_key_down(MAC_KEY_CONTROL_RIGHT))
     if "ALT" in mods:
-        checks.append(is_x11_key_down(X11_ALT_L) or is_x11_key_down(X11_ALT_R))
+        checks.append(is_mac_key_down(MAC_KEY_OPTION_LEFT) or is_mac_key_down(MAC_KEY_OPTION_RIGHT))
     if "COMMAND" in mods:
-        checks.append(is_x11_key_down(X11_SUPER_L) or is_x11_key_down(X11_SUPER_R))
+        checks.append(is_mac_key_down(MAC_KEY_COMMAND_LEFT) or is_mac_key_down(MAC_KEY_COMMAND_RIGHT))
     return bool(checks) and all(checks)
 
 
@@ -854,12 +807,10 @@ def collect_self_check():
     warnings = []
     passes = []
 
-    if not x11_ready():
-        errors.append("Linux X11 input unavailable (no X11 display); mouse clicks and movement cannot be detected")
+    if cg is None or cf is None:
+        errors.append("macOS CoreGraphics input API unavailable")
     else:
-        passes.append("Linux X11 input")
-    if is_wayland_session():
-        warnings.append("Wayland desktop detected: input can only be read over X11/XWayland windows, so detection may not work while another app is focused. An X11 session is recommended.")
+        passes.append("macOS CoreGraphics mouse/input API")
 
     passes.append("Profile: %s" % (current_profile or "Default"))
 
@@ -903,9 +854,9 @@ def collect_self_check():
                 else:
                     warnings.append("%s %s is Modifier Only but no modifier is selected" % (fid, func))
             elif "CAPS" in set((extra_modifiers[i] or "NONE").split("+")):
-                warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on Linux" % (fid, func))
+                warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on macOS" % (fid, func))
             elif extra_keys[i] in ("MOUSE_WHEEL_UP", "MOUSE_WHEEL_DOWN"):
-                warnings.append("%s %s uses %s, which is Windows-only; this input will not react on Linux" % (
+                warnings.append("%s %s uses %s, which is Windows-only; this input will not react on macOS" % (
                     fid, func, pretty_key_name(extra_keys[i])))
             else:
                 bindings = hotkey_bindings_to_plain(extra_hotkeys[i]) if i < len(extra_hotkeys) else []
@@ -1565,15 +1516,15 @@ def add_modifier_list(props, key, label):
         ("None", "NONE"),
         ("Ctrl", "CTRL"),
         ("Shift", "SHIFT"),
-        ("Alt", "ALT"),
+        ("Option (Alt)", "ALT"),
         ("Ctrl + Shift", "CTRL+SHIFT"),
-        ("Ctrl + Alt", "CTRL+ALT"),
-        ("Shift + Alt", "SHIFT+ALT"),
-        ("Ctrl + Shift + Alt", "CTRL+SHIFT+ALT"),
-        ("Super (Win)", "COMMAND"),
-        ("Super + Ctrl", "COMMAND+CTRL"),
-        ("Super + Shift", "COMMAND+SHIFT"),
-        ("Super + Alt", "COMMAND+ALT"),
+        ("Ctrl + Option", "CTRL+ALT"),
+        ("Shift + Option", "SHIFT+ALT"),
+        ("Ctrl + Shift + Option", "CTRL+SHIFT+ALT"),
+        ("Command", "COMMAND"),
+        ("Command + Ctrl", "COMMAND+CTRL"),
+        ("Command + Shift", "COMMAND+SHIFT"),
+        ("Command + Option", "COMMAND+ALT"),
     ]
     for display, value in choices:
         obs.obs_property_list_add_string(prop, display, value)
@@ -1640,6 +1591,7 @@ def add_source_list(props, key, label):
 
 
 def script_properties():
+    start_timers()
     props = obs.obs_properties_create()
 
     # OBS Python properties cannot safely use modified/button callbacks in this
@@ -2174,11 +2126,24 @@ def restore_saved_rest_position():
     return True
 
 def get_cursor_position():
-    """Return the current cursor position as (x, y), or None on failure."""
-    state = x11_pointer_state()
-    if state is None:
+    """Return current macOS cursor position as (x, y), or None on failure."""
+    if cg is None or cf is None:
         return None
-    return (state[0], state[1])
+    event = None
+    try:
+        event = cg.CGEventCreate(None)
+        if not event:
+            return None
+        point = cg.CGEventGetLocation(event)
+        return (float(point.x), float(point.y))
+    except Exception:
+        return None
+    finally:
+        if event:
+            try:
+                cf.CFRelease(event)
+            except Exception:
+                pass
 
 
 def poll_movement():
@@ -2306,9 +2271,15 @@ def poll_movement():
         clear_movement_state(keep_origin=False)
 
 
-def is_button_down(button_mask):
-    state = x11_pointer_state()
-    return bool(state and (state[2] & button_mask))
+def is_button_down(mouse_button):
+    if cg is None:
+        return False
+    try:
+        return bool(cg.CGEventSourceButtonState(
+            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(mouse_button)
+        ))
+    except Exception:
+        return False
 
 
 def set_items_visibility(scene, source_name, visible):
@@ -2399,8 +2370,8 @@ def poll_mouse_buttons():
 
     try:
         poll_extra_modifier_only_inputs()
-        new_left = is_button_down(X11_BUTTON1_MASK)
-        new_right = is_button_down(X11_BUTTON3_MASK)
+        new_left = is_button_down(CG_MOUSE_BUTTON_LEFT)
+        new_right = is_button_down(CG_MOUSE_BUTTON_RIGHT)
 
         if new_left != left_down or new_right != right_down:
             left_down = new_left
@@ -2452,6 +2423,8 @@ def run_startup_self_check_once():
 
 
 def script_load(settings):
+    global self_check_scheduled
+    self_check_scheduled = False
     global loaded, left_down, right_down
     global movement_enabled, movement_fault, movement_start_after
     global saved_rest_x, saved_rest_y, saved_rest_valid, startup_restored
@@ -2492,8 +2465,8 @@ def script_load(settings):
     movement_fault = False
     movement_start_after = time.monotonic() + MOVEMENT_STARTUP_DELAY
 
-    if not x11_ready():
-        log("ERROR: Linux X11 input is unavailable (no X11 display).")
+    if cg is None or cf is None:
+        log("ERROR: macOS CoreGraphics input API is unavailable.")
     # v4.0.3: the wheel listener is started by sync_wheel_hook() (via the
     # profile restore below) only when a slot uses Mouse Wheel Up/Down.
 
@@ -2551,13 +2524,14 @@ def script_load(settings):
     if right_source:
         set_source_visibility(right_source, False)
 
-    obs.timer_add(poll_mouse_buttons, POLL_MS)
     try:
-        obs.timer_add(run_startup_self_check_once, 2200)
+        obs.obs_frontend_add_event_callback(on_frontend_event)
     except Exception as exc:
-        log("Could not schedule startup self-check: %s" % exc)
+        log("Could not watch OBS loading; starting input polling now: %s" % exc)
+        start_timers()
 
 def script_unload():
+    stop_timers()
     global loaded, left_down, right_down, script_settings_ref
 
     stop_wheel_hook()
@@ -2601,5 +2575,4 @@ def script_unload():
             pass
         script_settings_ref = None
 
-    x11_close()
     loaded = False

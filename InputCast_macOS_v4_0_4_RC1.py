@@ -9,7 +9,7 @@ import time
 
 MAX_BUTTONS = 65
 INPUT_COUNT_CHOICES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
-VERSION = "InputCast_macOS_v4_0_3_RC2"
+VERSION = "InputCast_macOS_v4_0_4_RC1"
 PROFILE_DIRNAME = "ControlCast_profiles"
 LEGACY_PROFILE_FILENAME = "push_to_enable_30_profile.json"
 
@@ -616,6 +616,16 @@ def unregister_hotkey_slot(index):
 
 
 def sync_registered_hotkeys(active_count):
+    was_running = timers_running
+    stop_timers()
+    try:
+        return _sync_registered_hotkeys_inner(active_count)
+    finally:
+        if was_running:
+            start_timers()
+
+
+def _sync_registered_hotkeys_inner(active_count):
     desired = normalize_input_count_value(active_count)
     for i in range(MAX_BUTTONS):
         if i < desired:
@@ -1221,6 +1231,54 @@ def refresh_hotkey_descriptions():
 # OBS script interface
 # ------------------------------
 
+# ------------------------------
+# v4.0.4: start-up crash fix
+# ------------------------------
+# OBS keeps ONE "which Python script is running" marker for all scripts. A script
+# timer that fires while another script is still loading can clear that marker in
+# the middle of a hotkey registration, and OBS then crashes while starting
+# ("add_python_obs_callback" in the crash log). So the polling timers start only
+# after OBS has finished loading (or when the Scripts window shows this script),
+# and they pause while this script registers hotkeys.
+timers_running = False
+self_check_scheduled = False
+
+
+def start_timers():
+    global timers_running, self_check_scheduled
+    if timers_running or not loaded:
+        return
+    timers_running = True
+    try:
+        obs.timer_add(poll_modifier_only_inputs, MODIFIER_POLL_MS)
+    except Exception as exc:
+        timers_running = False
+        log("Could not start input polling: %s" % exc)
+    if self_check_scheduled:
+        return
+    self_check_scheduled = True  # once per load, not after every pause
+    try:
+        obs.timer_add(run_startup_self_check_once, 2200)
+    except Exception as exc:
+        log("Could not schedule startup self-check: %s" % exc)
+
+
+def stop_timers():
+    global timers_running
+    if not timers_running:
+        return
+    timers_running = False
+    try:
+        obs.timer_remove(poll_modifier_only_inputs)
+    except Exception:
+        pass
+
+
+def on_frontend_event(event):
+    if event in (obs.OBS_FRONTEND_EVENT_FINISHED_LOADING, obs.OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED):
+        start_timers()
+
+
 def script_description():
     return (
         "<b>%s</b><br><br>"
@@ -1236,6 +1294,7 @@ def script_description():
 
 
 def script_properties():
+    start_timers()
     props = obs.obs_properties_create()
     source_names = get_source_names()
 
@@ -1409,6 +1468,8 @@ def script_save(settings):
 
 
 def script_load(settings):
+    global self_check_scheduled
+    self_check_scheduled = False
     global script_settings_ref, loaded, current_profile
 
     log("Loaded %s from %s" % (VERSION, __file__))
@@ -1471,16 +1532,14 @@ def script_load(settings):
 
     refresh_hotkey_descriptions()
     try:
-        obs.timer_add(poll_modifier_only_inputs, MODIFIER_POLL_MS)
+        obs.obs_frontend_add_event_callback(on_frontend_event)
     except Exception as exc:
-        log("Could not start modifier-only input polling: %s" % exc)
-    try:
-        obs.timer_add(run_startup_self_check_once, 2200)
-    except Exception as exc:
-        log("Could not schedule startup self-check: %s" % exc)
+        log("Could not watch OBS loading; starting input polling now: %s" % exc)
+        start_timers()
 
 
 def script_unload():
+    stop_timers()
     global script_settings_ref, loaded
     loaded = False
     try:
