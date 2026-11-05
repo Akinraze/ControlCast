@@ -3,13 +3,13 @@ import json
 import os
 import re
 import ctypes
-import threading
+import subprocess
 import time
 
 
 MAX_BUTTONS = 65
 INPUT_COUNT_CHOICES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
-VERSION = "InputCast_Windows_v4_0_4"
+VERSION = "InputCast_macOS_v4_0_5_RC1"
 PROFILE_DIRNAME = "ControlCast_profiles"
 LEGACY_PROFILE_FILENAME = "push_to_enable_30_profile.json"
 
@@ -36,24 +36,34 @@ profile_operation_guard = False
 script_settings_ref = None
 loaded = False
 
-# Windows modifier-only polling state. OBS hotkey bindings require a primary key,
-# so modifier-only shortcuts (Shift, Ctrl, Alt, Win, Caps Lock, or combinations) are
-# detected directly with GetAsyncKeyState and then fed through the same
+# macOS modifier-only polling state. OBS hotkey bindings require a primary key,
+# so modifier-only shortcuts (Shift, Ctrl, Option, Command, or combinations) are
+# detected directly with CoreGraphics and then fed through the same
 # visibility/reference-count logic as normal OBS hotkeys.
 MODIFIER_POLL_MS = 16
 modifier_only_down = [False] * MAX_BUTTONS
 
-try:
-    user32 = ctypes.windll.user32
-except Exception:
-    user32 = None
+CG_EVENT_SOURCE_STATE_COMBINED_SESSION = 0
 
-VK_SHIFT = 0x10
-VK_CONTROL = 0x11
-VK_MENU = 0x12
-VK_LWIN = 0x5B
-VK_RWIN = 0x5C
-VK_CAPITAL = 0x14
+# macOS virtual key codes (left/right variants where applicable).
+MAC_KEY_SHIFT_LEFT = 56
+MAC_KEY_SHIFT_RIGHT = 60
+MAC_KEY_CONTROL_LEFT = 59
+MAC_KEY_CONTROL_RIGHT = 62
+MAC_KEY_OPTION_LEFT = 58
+MAC_KEY_OPTION_RIGHT = 61
+MAC_KEY_COMMAND_LEFT = 55
+MAC_KEY_COMMAND_RIGHT = 54
+
+cg = None
+try:
+    cg = ctypes.CDLL(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+    )
+    cg.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
+    cg.CGEventSourceKeyState.restype = ctypes.c_bool
+except Exception:
+    cg = None
 
 
 # ------------------------------
@@ -80,13 +90,13 @@ _WINDOWS_RESERVED_NAMES = (
 
 
 def scrub_text(text):
-    """Replace the Windows user-profile folder so logs and popups are safe to share."""
+    """Replace your home folder path with ~ so logs and pop-ups are safe to share."""
     try:
         text = str(text)
         home = os.path.expanduser("~")
         if home and home != "~" and len(home) > 3:
             for variant in {home, home.replace("\\", "/")}:
-                text = re.sub(re.escape(variant), "%USERPROFILE%", text, flags=re.IGNORECASE)
+                text = re.sub(re.escape(variant), "~", text, flags=re.IGNORECASE)
         return text
     except Exception:
         return str(text)
@@ -201,44 +211,32 @@ def legacy_modifier_only_code(bindings):
     return None
 
 
-MB_OK = 0x00000000
-MB_ICONERROR = 0x00000010
-MB_ICONWARNING = 0x00000030
-MB_ICONINFORMATION = 0x00000040
-MB_SETFOREGROUND = 0x00010000
-MB_TOPMOST = 0x00040000
-
-
 def show_native_message(title, message, error=False, warning=False):
-    """Show a Windows message box without blocking OBS and without launching any program.
+    """Open a detached macOS dialog so OBS scripting/timers never block.
 
-    The dialog lives on its own short-lived thread, so OBS timers keep running while
-    it is open. (v4.0.1 launched a hidden, encoded PowerShell process instead, which
-    antivirus tools commonly flag.)
+    osascript is Apple's own built-in scripting tool. The title and message are
+    passed as arguments (never pasted into the script text), so their contents
+    cannot change what the dialog does.
     """
-    if user32 is None:
-        return False
     try:
-        flags = MB_OK | MB_SETFOREGROUND | MB_TOPMOST
-        if error:
-            flags |= MB_ICONERROR
-        elif warning:
-            flags |= MB_ICONWARNING
-        else:
-            flags |= MB_ICONINFORMATION
-        safe_title = scrub_text(title)
-        safe_message = scrub_text(message)
-
-        def _show():
-            try:
-                user32.MessageBoxW(None, safe_message, safe_title, flags)
-            except Exception as exc:
-                log("Diagnostic window failed: %s" % exc)
-
-        threading.Thread(target=_show, name="ControlCastMessageBox", daemon=True).start()
+        script = (
+            'on run argv\n'
+            'set dialogTitle to item 1 of argv\n'
+            'set dialogMessage to item 2 of argv\n'
+            'display dialog dialogMessage with title dialogTitle buttons {"OK"} default button "OK"\n'
+            'end run'
+        )
+        subprocess.Popen(
+            ["osascript", "-e", script, scrub_text(title), scrub_text(message)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
         return True
     except Exception as exc:
-        log("Could not show diagnostic window: %s" % exc)
+        log("Could not open macOS diagnostic window: %s" % exc)
         return False
 
 
@@ -253,8 +251,44 @@ def script_folder():
         return os.getcwd()
 
 
+# v4.0.5: when the script sits in a read-only place (a shared or network folder, a write-protected drive),
+# profiles are kept in your user settings folder instead of failing to load (found 2026-11-04).
+_profiles_dir = None
+
+
+def user_data_folder():
+    import sys
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ControlCast")
+
+
+def _folder_is_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".controlcast_write_test")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def profiles_folder():
-    return os.path.join(script_folder(), PROFILE_DIRNAME)
+    global _profiles_dir
+    if _profiles_dir is None:
+        beside = os.path.join(script_folder(), PROFILE_DIRNAME)
+        if _folder_is_writable(beside):
+            _profiles_dir = beside
+        else:
+            _profiles_dir = os.path.join(user_data_folder(), PROFILE_DIRNAME)
+            log("The script's folder is read-only; profiles are kept in %s" % _profiles_dir)
+    return _profiles_dir
 
 
 def legacy_profile_path():
@@ -450,27 +484,15 @@ def add_modifier_list(props, key, label):
         ("None", "NONE"),
         ("Ctrl", "CTRL"),
         ("Shift", "SHIFT"),
-        ("Alt", "ALT"),
+        ("Option (Alt)", "ALT"),
         ("Ctrl + Shift", "CTRL+SHIFT"),
-        ("Ctrl + Alt", "CTRL+ALT"),
-        ("Shift + Alt", "SHIFT+ALT"),
-        ("Ctrl + Shift + Alt", "CTRL+SHIFT+ALT"),
-        ("Win / Command", "COMMAND"),
-        ("Win/Cmd + Ctrl", "COMMAND+CTRL"),
-        ("Win/Cmd + Shift", "COMMAND+SHIFT"),
-        ("Win/Cmd + Alt", "COMMAND+ALT"),
-        ("Caps Lock", "CAPS"),
-        ("Ctrl + Caps Lock", "CTRL+CAPS"),
-        ("Shift + Caps Lock", "SHIFT+CAPS"),
-        ("Alt + Caps Lock", "ALT+CAPS"),
-        ("Ctrl + Shift + Caps Lock", "CTRL+SHIFT+CAPS"),
-        ("Ctrl + Alt + Caps Lock", "CTRL+ALT+CAPS"),
-        ("Shift + Alt + Caps Lock", "SHIFT+ALT+CAPS"),
-        ("Ctrl + Shift + Alt + Caps Lock", "CTRL+SHIFT+ALT+CAPS"),
-        ("Win/Cmd + Caps Lock", "COMMAND+CAPS"),
-        ("Win/Cmd + Ctrl + Caps Lock", "COMMAND+CTRL+CAPS"),
-        ("Win/Cmd + Shift + Caps Lock", "COMMAND+SHIFT+CAPS"),
-        ("Win/Cmd + Alt + Caps Lock", "COMMAND+ALT+CAPS"),
+        ("Ctrl + Option", "CTRL+ALT"),
+        ("Shift + Option", "SHIFT+ALT"),
+        ("Ctrl + Shift + Option", "CTRL+SHIFT+ALT"),
+        ("Command", "COMMAND"),
+        ("Command + Ctrl", "COMMAND+CTRL"),
+        ("Command + Shift", "COMMAND+SHIFT"),
+        ("Command + Option", "COMMAND+ALT"),
     ]
     for display, value in choices:
         obs.obs_property_list_add_string(prop, display, value)
@@ -647,7 +669,6 @@ def _sync_registered_hotkeys_inner(active_count):
         else:
             unregister_hotkey_slot(i)
 
-
 def binding_from_ui(key_name, modifier_code):
     if not key_name or key_name in ("OBS_HOTKEYS", "UNASSIGNED", "MODIFIER_ONLY"):
         return []
@@ -685,107 +706,46 @@ def apply_ui_binding(index):
     if key_name == "OBS_HOTKEYS":
         return
     # UNASSIGNED and MODIFIER_ONLY intentionally clear any previous OBS binding.
-    # Modifier-only input is polled directly on Windows instead.
+    # Modifier-only input is polled directly through macOS CoreGraphics instead.
     bindings = binding_from_ui(key_name, button_modifiers[index])
     load_hotkey_binding(index, bindings)
 
 
-def is_vk_down(vk_code):
-    if user32 is None:
+def is_mac_key_down(key_code):
+    if cg is None:
         return False
     try:
-        return (user32.GetAsyncKeyState(vk_code) & 0x8000) != 0
+        return bool(cg.CGEventSourceKeyState(
+            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(key_code)
+        ))
     except Exception:
         return False
 
 
 def key_name_to_vk(key_name):
-    # Windows virtual-key mapping for every directly selectable InputCast key.
-    if not key_name:
-        return None
-
-    if key_name.startswith("OBS_KEY_"):
-        suffix = key_name[8:]
-    else:
-        suffix = key_name
-
-    if len(suffix) == 1 and suffix in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
-        return ord(suffix)
-
-    if suffix.startswith("F") and suffix[1:].isdigit():
-        number = int(suffix[1:])
-        if 1 <= number <= 24:
-            return 0x70 + number - 1
-
-    if suffix.startswith("NUM") and len(suffix) == 4 and suffix[-1].isdigit():
-        return 0x60 + int(suffix[-1])
-
-    mapping = {
-        "SPACE": 0x20,
-        "RETURN": 0x0D,
-        "TAB": 0x09,
-        "ESCAPE": 0x1B,
-        "BACKSPACE": 0x08,
-        "DELETE": 0x2E,
-        "INSERT": 0x2D,
-        "HOME": 0x24,
-        "END": 0x23,
-        "PAGEUP": 0x21,
-        "PAGEDOWN": 0x22,
-        "UP": 0x26,
-        "DOWN": 0x28,
-        "LEFT": 0x25,
-        "RIGHT": 0x27,
-        "MINUS": 0xBD,
-        "EQUAL": 0xBB,
-        "BRACKETLEFT": 0xDB,
-        "BRACKETRIGHT": 0xDD,
-        "SEMICOLON": 0xBA,
-        "APOSTROPHE": 0xDE,
-        "COMMA": 0xBC,
-        "PERIOD": 0xBE,
-        "SLASH": 0xBF,
-        "BACKSLASH": 0xDC,
-        "ASCIITILDE": 0xC0,
-        "NUMPLUS": 0x6B,
-        "NUMMINUS": 0x6D,
-        "NUMASTERISK": 0x6A,
-        "NUMSLASH": 0x6F,
-        "NUMPERIOD": 0x6E,
-        "MOUSE1": 0x01,
-        "MOUSE2": 0x02,
-        "MOUSE3": 0x04,
-        "MOUSE4": 0x05,
-        "MOUSE5": 0x06,
-    }
-    return mapping.get(suffix)
+    """Caps Lock key combinations are Windows-only; nothing is mapped on macOS."""
+    return None
 
 
 def ui_key_is_down(key_name):
-    vk = key_name_to_vk(key_name)
-    return False if vk is None else is_vk_down(vk)
+    return False
 
 
 def modifier_combo_is_down(modifier_code):
     mods = set((modifier_code or "NONE").split("+"))
     mods.discard("NONE")
-    if not mods:
+    if not mods or "CAPS" in mods:
+        # Caps Lock combinations are a Windows-only feature (see self-check).
         return False
-
     checks = []
     if "SHIFT" in mods:
-        checks.append(is_vk_down(VK_SHIFT))
+        checks.append(is_mac_key_down(MAC_KEY_SHIFT_LEFT) or is_mac_key_down(MAC_KEY_SHIFT_RIGHT))
     if "CTRL" in mods:
-        checks.append(is_vk_down(VK_CONTROL))
+        checks.append(is_mac_key_down(MAC_KEY_CONTROL_LEFT) or is_mac_key_down(MAC_KEY_CONTROL_RIGHT))
     if "ALT" in mods:
-        checks.append(is_vk_down(VK_MENU))
+        checks.append(is_mac_key_down(MAC_KEY_OPTION_LEFT) or is_mac_key_down(MAC_KEY_OPTION_RIGHT))
     if "COMMAND" in mods:
-        checks.append(is_vk_down(VK_LWIN) or is_vk_down(VK_RWIN))
-    if "CAPS" in mods:
-        # High bit = Caps Lock key is physically held down. We intentionally do
-        # not use the toggle-state bit because InputCast treats CAPS as a modifier.
-        checks.append(is_vk_down(VK_CAPITAL))
-
+        checks.append(is_mac_key_down(MAC_KEY_COMMAND_LEFT) or is_mac_key_down(MAC_KEY_COMMAND_RIGHT))
     return bool(checks) and all(checks)
 
 
@@ -1206,6 +1166,18 @@ def collect_self_check():
     passes = ["Profile: %s" % current_profile, "Active input slots: %d / %d" % (input_count, MAX_BUTTONS)]
     configured = 0
 
+    uses_modifier_only = any(
+        idx < input_count and button_keys[idx] == "MODIFIER_ONLY"
+        for idx in range(MAX_BUTTONS)
+    )
+    if cg is None:
+        if uses_modifier_only:
+            errors.append("macOS CoreGraphics input API unavailable; Modifier Only inputs cannot be detected")
+        else:
+            warnings.append("macOS CoreGraphics input API unavailable; OBS-managed hotkeys can still operate")
+    else:
+        passes.append("macOS CoreGraphics modifier input API")
+
     for i in range(input_count):
         src = button_sources[i]
         if not src:
@@ -1223,14 +1195,7 @@ def collect_self_check():
             else:
                 warnings.append("%s %s is Modifier Only but no modifier is selected" % (fid, src))
         elif "CAPS" in mods:
-            if button_keys[i] == "OBS_HOTKEYS":
-                warnings.append("%s %s uses Caps Lock with OBS Hotkeys; choose a direct Shortcut Key because OBS has no native Caps Lock modifier" % (fid, src))
-            elif button_keys[i] == "UNASSIGNED":
-                warnings.append("%s %s uses a Caps Lock modifier but the Shortcut Key is Unassigned" % (fid, src))
-            elif key_name_to_vk(button_keys[i]) is None:
-                warnings.append("%s %s Caps Lock combo uses an unsupported direct key" % (fid, src))
-            else:
-                passes.append("%s input: %s + %s (direct Windows polling)" % (fid, button_modifiers[i].replace("+", " + ").title(), pretty_key_name(button_keys[i])))
+            warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on macOS" % (fid, src))
         else:
             bindings = slot_hotkey_bindings(i)
             if bindings:
@@ -1316,7 +1281,7 @@ self_check_scheduled = False
 
 
 def start_timers():
-    global timers_running
+    global timers_running, self_check_scheduled
     if timers_running or not loaded:
         return
     timers_running = True
@@ -1325,7 +1290,6 @@ def start_timers():
     except Exception as exc:
         timers_running = False
         log("Could not start input polling: %s" % exc)
-    global self_check_scheduled
     if self_check_scheduled:
         return
     self_check_scheduled = True  # once per load, not after every pause
@@ -1354,12 +1318,13 @@ def on_frontend_event(event):
 def script_description():
     return (
         "<b>%s</b><br><br>"
-        "Windows test build for <b>InputCast</b> named profiles and live switching.<br>"
+        "macOS Community Test build for <b>InputCast</b> named profiles and live switching.<br>"
+        "<b>UNTESTED BY TESTERS:</b> this macOS build has not been run on a real Mac by any tester. Expect problems and please report results on GitHub Issues.<br><br>"
         "Profiles can be switched while OBS is running/recording; no OBS restart is required.<br><b>Module:</b> InputCast — bind keys, modifiers, controller/special-device hotkeys, and other inputs to reactive OBS source actions.<br><br>"
         "<b>Profile controls:</b> select an Active Profile to switch live. Use New Profile Name + Profile Action, then check Confirm / Execute Selected Profile Action.<br>"
         "<b>Setup / Preview Mode:</b> when enabled, all assigned graphics are forced visible to help with placement and layout.<br>"
         "<b>Input count:</b> each profile can use 5 to 65 programmable inputs in steps of 5. Only active slots are registered in OBS Hotkeys.<br>"
-        "<b>Shortcut assignment:</b> choose a Key and Modifiers directly here, choose 'Modifier only' for Shift/Ctrl/Alt/Win/Caps Lock without a second key. Caps Lock combinations use direct Windows polling, so select the primary Shortcut Key in InputCast rather than leaving that slot on OBS Hotkeys. Leave Key on 'Assign / keep binding in OBS Hotkeys' for controllers/special hardware that do not use Caps Lock.<br><br>"
+        "<b>Shortcut assignment:</b> choose a Key and Modifiers directly here, choose 'Modifier only' for Shift/Ctrl/Option/Command without a second key, or leave Key on 'Assign / keep binding in OBS Hotkeys' for controllers/special hardware. Caps Lock combinations are Windows-only for now.<br><br>"
         "NOTE: The number of visible rows is determined when the Scripts panel is opened. If you change Input Count or switch to a profile with a different count, the new profile becomes active immediately, but close/reopen the Scripts window to refresh the number of displayed rows."
     ) % VERSION
 

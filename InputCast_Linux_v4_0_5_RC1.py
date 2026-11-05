@@ -3,13 +3,14 @@ import json
 import os
 import re
 import ctypes
+import shutil
 import subprocess
 import time
 
 
 MAX_BUTTONS = 65
 INPUT_COUNT_CHOICES = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
-VERSION = "InputCast_macOS_v4_0_4_RC1"
+VERSION = "InputCast_Linux_v4_0_5_RC1"
 PROFILE_DIRNAME = "ControlCast_profiles"
 LEGACY_PROFILE_FILENAME = "push_to_enable_30_profile.json"
 
@@ -36,34 +37,12 @@ profile_operation_guard = False
 script_settings_ref = None
 loaded = False
 
-# macOS modifier-only polling state. OBS hotkey bindings require a primary key,
-# so modifier-only shortcuts (Shift, Ctrl, Option, Command, or combinations) are
-# detected directly with CoreGraphics and then fed through the same
+# Linux modifier-only polling state. OBS hotkey bindings require a primary key,
+# so modifier-only shortcuts (Shift, Ctrl, Alt, Super, or combinations) are
+# read directly from the X11 display server and then fed through the same
 # visibility/reference-count logic as normal OBS hotkeys.
 MODIFIER_POLL_MS = 16
 modifier_only_down = [False] * MAX_BUTTONS
-
-CG_EVENT_SOURCE_STATE_COMBINED_SESSION = 0
-
-# macOS virtual key codes (left/right variants where applicable).
-MAC_KEY_SHIFT_LEFT = 56
-MAC_KEY_SHIFT_RIGHT = 60
-MAC_KEY_CONTROL_LEFT = 59
-MAC_KEY_CONTROL_RIGHT = 62
-MAC_KEY_OPTION_LEFT = 58
-MAC_KEY_OPTION_RIGHT = 61
-MAC_KEY_COMMAND_LEFT = 55
-MAC_KEY_COMMAND_RIGHT = 54
-
-cg = None
-try:
-    cg = ctypes.CDLL(
-        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
-    )
-    cg.CGEventSourceKeyState.argtypes = [ctypes.c_int32, ctypes.c_uint16]
-    cg.CGEventSourceKeyState.restype = ctypes.c_bool
-except Exception:
-    cg = None
 
 
 # ------------------------------
@@ -212,31 +191,176 @@ def legacy_modifier_only_code(bindings):
 
 
 def show_native_message(title, message, error=False, warning=False):
-    """Open a detached macOS dialog so OBS scripting/timers never block.
+    """Show a desktop pop-up without blocking OBS.
 
-    osascript is Apple's own built-in scripting tool. The title and message are
-    passed as arguments (never pasted into the script text), so their contents
-    cannot change what the dialog does.
+    Uses zenity (GNOME and most desktops) or kdialog (KDE) when installed. The
+    text is passed as arguments, never through a shell, so it cannot change what
+    runs. When neither tool exists, the message is still in the Script Log.
     """
+    safe_title = scrub_text(title)
+    safe_message = scrub_text(message)
+    kind = "error" if error else ("warning" if warning else "info")
+    candidates = [
+        ["zenity", "--%s" % kind, "--no-markup", "--title", safe_title, "--text", safe_message],
+        ["kdialog", "--title", safe_title,
+         {"error": "--error", "warning": "--sorry", "info": "--msgbox"}[kind], safe_message],
+    ]
+    for args in candidates:
+        if shutil.which(args[0]) is None:
+            continue
+        try:
+            subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=True,
+            )
+            return True
+        except Exception as exc:
+            log("Could not open %s pop-up: %s" % (args[0], exc))
+    log("No pop-up tool (zenity or kdialog) found; see the message above in the Script Log.")
+    return False
+
+
+# ------------------------------
+# Linux X11 input layer
+# ------------------------------
+# Reads the mouse buttons, cursor position and modifier keys from the X11 display
+# server (libX11, part of every X11 desktop). Nothing is recorded, stored or sent
+# anywhere. On Wayland desktops the X11 server only sees XWayland windows, so
+# detection is limited there (the startup self-check says so).
+
+X11_SHIFT_L = 0xFFE1
+X11_SHIFT_R = 0xFFE2
+X11_CONTROL_L = 0xFFE3
+X11_CONTROL_R = 0xFFE4
+X11_ALT_L = 0xFFE9
+X11_ALT_R = 0xFFEA
+X11_SUPER_L = 0xFFEB
+X11_SUPER_R = 0xFFEC
+
+X11_BUTTON1_MASK = 1 << 8   # left button
+X11_BUTTON3_MASK = 1 << 10  # right button
+
+x11 = None
+x11_display = None
+x11_root = 0
+x11_failed = False
+_x11_keycodes = {}
+_x11_keymap = None
+_x11_keymap_time = 0.0
+
+
+def is_wayland_session():
+    return (
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+
+def x11_ready():
+    """Open the X11 connection on first use. Returns True when input can be read."""
+    global x11, x11_display, x11_root, x11_failed
+    if x11_display:
+        return True
+    if x11_failed:
+        return False
     try:
-        script = (
-            'on run argv\n'
-            'set dialogTitle to item 1 of argv\n'
-            'set dialogMessage to item 2 of argv\n'
-            'display dialog dialogMessage with title dialogTitle buttons {"OK"} default button "OK"\n'
-            'end run'
-        )
-        subprocess.Popen(
-            ["osascript", "-e", script, scrub_text(title), scrub_text(message)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=True,
-        )
+        if x11 is None:
+            lib = None
+            for name in ("libX11.so.6", "libX11.so"):
+                try:
+                    lib = ctypes.CDLL(name)
+                    break
+                except OSError:
+                    continue
+            if lib is None:
+                raise OSError("libX11 not found")
+            lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            lib.XOpenDisplay.restype = ctypes.c_void_p
+            lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            lib.XDefaultRootWindow.restype = ctypes.c_ulong
+            lib.XQueryPointer.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            lib.XQueryPointer.restype = ctypes.c_int
+            lib.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+            lib.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            lib.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x11 = lib
+        display = x11.XOpenDisplay(None)
+        if not display:
+            raise OSError("no X11 display (is DISPLAY set?)")
+        x11_display = display
+        x11_root = x11.XDefaultRootWindow(display)
+        _x11_keycodes.clear()
         return True
     except Exception as exc:
-        log("Could not open macOS diagnostic window: %s" % exc)
+        x11_failed = True
+        log("X11 input unavailable: %s" % exc)
+        return False
+
+
+def x11_close():
+    global x11_display, x11_failed
+    if x11 is not None and x11_display:
+        try:
+            x11.XCloseDisplay(x11_display)
+        except Exception:
+            pass
+    x11_display = None
+    x11_failed = False
+
+
+def x11_pointer_state():
+    """Return (x, y, button_mask) for the pointer, or None."""
+    if not x11_ready():
+        return None
+    try:
+        root = ctypes.c_ulong()
+        child = ctypes.c_ulong()
+        rx, ry, wx, wy = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        mask = ctypes.c_uint()
+        if not x11.XQueryPointer(
+            x11_display, x11_root,
+            ctypes.byref(root), ctypes.byref(child),
+            ctypes.byref(rx), ctypes.byref(ry),
+            ctypes.byref(wx), ctypes.byref(wy),
+            ctypes.byref(mask),
+        ):
+            return None
+        return (float(rx.value), float(ry.value), int(mask.value))
+    except Exception:
+        return None
+
+
+def is_x11_key_down(keysym):
+    """True while the key for this X11 keysym is physically held."""
+    global _x11_keymap, _x11_keymap_time
+    if not x11_ready():
+        return False
+    try:
+        keycode = _x11_keycodes.get(keysym)
+        if keycode is None:
+            keycode = int(x11.XKeysymToKeycode(x11_display, keysym))
+            _x11_keycodes[keysym] = keycode
+        if not keycode:
+            return False
+        now = time.monotonic()
+        if _x11_keymap is None or now - _x11_keymap_time > 0.005:
+            buffer = (ctypes.c_char * 32)()
+            x11.XQueryKeymap(x11_display, buffer)
+            _x11_keymap = bytes(buffer.raw)
+            _x11_keymap_time = now
+        return bool(_x11_keymap[keycode // 8] & (1 << (keycode % 8)))
+    except Exception:
         return False
 
 
@@ -251,8 +375,44 @@ def script_folder():
         return os.getcwd()
 
 
+# v4.0.5: when the script sits in a read-only place (a shared or network folder, a write-protected drive),
+# profiles are kept in your user settings folder instead of failing to load (found 2026-11-04).
+_profiles_dir = None
+
+
+def user_data_folder():
+    import sys
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ControlCast")
+
+
+def _folder_is_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".controlcast_write_test")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def profiles_folder():
-    return os.path.join(script_folder(), PROFILE_DIRNAME)
+    global _profiles_dir
+    if _profiles_dir is None:
+        beside = os.path.join(script_folder(), PROFILE_DIRNAME)
+        if _folder_is_writable(beside):
+            _profiles_dir = beside
+        else:
+            _profiles_dir = os.path.join(user_data_folder(), PROFILE_DIRNAME)
+            log("The script's folder is read-only; profiles are kept in %s" % _profiles_dir)
+    return _profiles_dir
 
 
 def legacy_profile_path():
@@ -448,15 +608,15 @@ def add_modifier_list(props, key, label):
         ("None", "NONE"),
         ("Ctrl", "CTRL"),
         ("Shift", "SHIFT"),
-        ("Option (Alt)", "ALT"),
+        ("Alt", "ALT"),
         ("Ctrl + Shift", "CTRL+SHIFT"),
-        ("Ctrl + Option", "CTRL+ALT"),
-        ("Shift + Option", "SHIFT+ALT"),
-        ("Ctrl + Shift + Option", "CTRL+SHIFT+ALT"),
-        ("Command", "COMMAND"),
-        ("Command + Ctrl", "COMMAND+CTRL"),
-        ("Command + Shift", "COMMAND+SHIFT"),
-        ("Command + Option", "COMMAND+ALT"),
+        ("Ctrl + Alt", "CTRL+ALT"),
+        ("Shift + Alt", "SHIFT+ALT"),
+        ("Ctrl + Shift + Alt", "CTRL+SHIFT+ALT"),
+        ("Super (Win)", "COMMAND"),
+        ("Super + Ctrl", "COMMAND+CTRL"),
+        ("Super + Shift", "COMMAND+SHIFT"),
+        ("Super + Alt", "COMMAND+ALT"),
     ]
     for display, value in choices:
         obs.obs_property_list_add_string(prop, display, value)
@@ -670,24 +830,18 @@ def apply_ui_binding(index):
     if key_name == "OBS_HOTKEYS":
         return
     # UNASSIGNED and MODIFIER_ONLY intentionally clear any previous OBS binding.
-    # Modifier-only input is polled directly through macOS CoreGraphics instead.
+    # Modifier-only input is read directly from X11 instead.
     bindings = binding_from_ui(key_name, button_modifiers[index])
     load_hotkey_binding(index, bindings)
 
 
-def is_mac_key_down(key_code):
-    if cg is None:
-        return False
-    try:
-        return bool(cg.CGEventSourceKeyState(
-            CG_EVENT_SOURCE_STATE_COMBINED_SESSION, int(key_code)
-        ))
-    except Exception:
-        return False
+def is_vk_down(vk_code):
+    """Windows key codes are not used on Linux."""
+    return False
 
 
 def key_name_to_vk(key_name):
-    """Caps Lock key combinations are Windows-only; nothing is mapped on macOS."""
+    """Caps Lock key combinations are Windows-only; nothing is mapped on Linux."""
     return None
 
 
@@ -703,13 +857,13 @@ def modifier_combo_is_down(modifier_code):
         return False
     checks = []
     if "SHIFT" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_SHIFT_LEFT) or is_mac_key_down(MAC_KEY_SHIFT_RIGHT))
+        checks.append(is_x11_key_down(X11_SHIFT_L) or is_x11_key_down(X11_SHIFT_R))
     if "CTRL" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_CONTROL_LEFT) or is_mac_key_down(MAC_KEY_CONTROL_RIGHT))
+        checks.append(is_x11_key_down(X11_CONTROL_L) or is_x11_key_down(X11_CONTROL_R))
     if "ALT" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_OPTION_LEFT) or is_mac_key_down(MAC_KEY_OPTION_RIGHT))
+        checks.append(is_x11_key_down(X11_ALT_L) or is_x11_key_down(X11_ALT_R))
     if "COMMAND" in mods:
-        checks.append(is_mac_key_down(MAC_KEY_COMMAND_LEFT) or is_mac_key_down(MAC_KEY_COMMAND_RIGHT))
+        checks.append(is_x11_key_down(X11_SUPER_L) or is_x11_key_down(X11_SUPER_R))
     return bool(checks) and all(checks)
 
 
@@ -1134,13 +1288,14 @@ def collect_self_check():
         idx < input_count and button_keys[idx] == "MODIFIER_ONLY"
         for idx in range(MAX_BUTTONS)
     )
-    if cg is None:
-        if uses_modifier_only:
-            errors.append("macOS CoreGraphics input API unavailable; Modifier Only inputs cannot be detected")
-        else:
-            warnings.append("macOS CoreGraphics input API unavailable; OBS-managed hotkeys can still operate")
+    target = errors if uses_modifier_only else warnings
+
+    if not x11_ready():
+        target.append("Linux X11 input unavailable (no X11 display); Modifier Only inputs cannot be detected (OBS-managed hotkeys can still work)")
     else:
-        passes.append("macOS CoreGraphics modifier input API")
+        passes.append("Linux X11 input")
+    if is_wayland_session():
+        warnings.append("Wayland desktop detected: input can only be read over X11/XWayland windows, so detection may not work while another app is focused. An X11 session is recommended.")
 
     for i in range(input_count):
         src = button_sources[i]
@@ -1159,7 +1314,7 @@ def collect_self_check():
             else:
                 warnings.append("%s %s is Modifier Only but no modifier is selected" % (fid, src))
         elif "CAPS" in mods:
-            warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on macOS" % (fid, src))
+            warnings.append("%s %s uses Caps Lock, which is Windows-only; this input will not react on Linux" % (fid, src))
         else:
             bindings = slot_hotkey_bindings(i)
             if bindings:
@@ -1282,13 +1437,13 @@ def on_frontend_event(event):
 def script_description():
     return (
         "<b>%s</b><br><br>"
-        "macOS Community Test build for <b>InputCast</b> named profiles and live switching.<br>"
-        "<b>UNTESTED BY TESTERS:</b> this macOS build has not been run on a real Mac by any tester. Expect problems and please report results on GitHub Issues.<br><br>"
+        "Linux (X11) Community Test build for <b>InputCast</b> named profiles and live switching.<br>"
+        "<b>UNTESTED BY TESTERS:</b> this Linux build has not been run on a real Linux PC by any tester. It targets X11 desktops; on Wayland, mouse and modifier detection is limited. Expect problems and please report results on GitHub Issues.<br><br>"
         "Profiles can be switched while OBS is running/recording; no OBS restart is required.<br><b>Module:</b> InputCast — bind keys, modifiers, controller/special-device hotkeys, and other inputs to reactive OBS source actions.<br><br>"
         "<b>Profile controls:</b> select an Active Profile to switch live. Use New Profile Name + Profile Action, then check Confirm / Execute Selected Profile Action.<br>"
         "<b>Setup / Preview Mode:</b> when enabled, all assigned graphics are forced visible to help with placement and layout.<br>"
         "<b>Input count:</b> each profile can use 5 to 65 programmable inputs in steps of 5. Only active slots are registered in OBS Hotkeys.<br>"
-        "<b>Shortcut assignment:</b> choose a Key and Modifiers directly here, choose 'Modifier only' for Shift/Ctrl/Option/Command without a second key, or leave Key on 'Assign / keep binding in OBS Hotkeys' for controllers/special hardware. Caps Lock combinations are Windows-only for now.<br><br>"
+        "<b>Shortcut assignment:</b> choose a Key and Modifiers directly here, choose 'Modifier only' for Shift/Ctrl/Alt/Super without a second key, or leave Key on 'Assign / keep binding in OBS Hotkeys' for controllers/special hardware. Caps Lock combinations are Windows-only for now.<br><br>"
         "NOTE: The number of visible rows is determined when the Scripts panel is opened. If you change Input Count or switch to a profile with a different count, the new profile becomes active immediately, but close/reopen the Scripts window to refresh the number of displayed rows."
     ) % VERSION
 
@@ -1556,3 +1711,4 @@ def script_unload():
         except Exception:
             pass
         script_settings_ref = None
+    x11_close()

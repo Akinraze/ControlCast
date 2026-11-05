@@ -22,7 +22,7 @@ import re
 import subprocess
 import threading
 
-VERSION = "MouseCast_macOS_v4_0_4_RC1"
+VERSION = "MouseCast_macOS_v4_0_5_RC1"
 POLL_MS = 16  # ~60 Hz; more than enough for OBS animation and much safer than 10 ms
 MOVEMENT_STARTUP_DELAY = 1.5  # seconds; lets OBS finish restoring scenes before movement begins
 
@@ -465,8 +465,44 @@ def script_folder():
         return os.getcwd()
 
 
+# v4.0.5: when the script sits in a read-only place (a shared or network folder, a write-protected drive),
+# profiles are kept in your user settings folder instead of failing to load (found 2026-11-04).
+_profiles_dir = None
+
+
+def user_data_folder():
+    import sys
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ControlCast")
+
+
+def _folder_is_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".controlcast_write_test")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def profiles_folder():
-    return os.path.join(script_folder(), PROFILE_DIRNAME)
+    global _profiles_dir
+    if _profiles_dir is None:
+        beside = os.path.join(script_folder(), PROFILE_DIRNAME)
+        if _folder_is_writable(beside):
+            _profiles_dir = beside
+        else:
+            _profiles_dir = os.path.join(user_data_folder(), PROFILE_DIRNAME)
+            log("The script's folder is read-only; profiles are kept in %s" % _profiles_dir)
+    return _profiles_dir
 
 
 def legacy_profile_path():

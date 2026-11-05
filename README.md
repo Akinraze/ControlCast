@@ -88,7 +88,12 @@ There are no required layouts, image styles, naming conventions, or asset folder
 
 ## Current Modules
 
-> **Latest Windows update: v4.0.4** — [all files on the v4.0.4 release page](https://github.com/Akinraze/ControlCast/releases/tag/v4.0.4)
+> **Latest update: v4.0.5**
+>
+> - **Both (fix):** when a script is run from a read-only place (a shared or network folder, a write-protected drive), it no longer fails to load with "The media is write protected" errors. Its profiles are kept in your user settings folder instead (`%APPDATA%\ControlCast` on Windows, `~/Library/Application Support/ControlCast` on macOS, `~/.config/ControlCast` on Linux). Same fix in macOS v4.0.5 RC1 and Linux v4.0.5 RC1 (still **UNTESTED BY TESTERS**).
+> - **Tip:** in OBS **Tools → Scripts → Python Settings**, pick the folder that contains `python3xx.dll` (for example `...\Programs\Python\Python312`), not a folder above it.
+>
+> **v4.0.4** — [all files on the v4.0.4 release page](https://github.com/Akinraze/ControlCast/releases/tag/v4.0.5)
 >
 > - **Both (fix):** OBS could crash while starting when MouseCast and InputCast were both loaded (crash log: `add_python_obs_callback`). The scripts now start their input checks only after OBS has finished loading, and pause them while hotkeys are being set up. Your profiles and hotkeys are unchanged; the inputs simply start working a moment after OBS opens.
 > - **macOS / Linux:** the same fix is in macOS v4.0.4 RC1 and Linux (X11) v4.0.4 RC1. These are still **UNTESTED BY TESTERS**.
@@ -106,9 +111,9 @@ There are no required layouts, image styles, naming conventions, or asset folder
 >
 > Earlier: v4.0.1 added Caps Lock modifiers (InputCast) and Mouse Wheel Up / Down (MouseCast).
 >
-> **macOS v4.0.4 RC1 and Linux v4.0.4 RC1 are UNTESTED BY TESTERS.** No tester has run them on a real Mac or a real Linux PC yet. They carry the same fixes as Windows v4.0.4 (including the startup crash fix), but expect problems and please report what you find.
+> **macOS v4.0.5 RC1 and Linux v4.0.5 RC1 are UNTESTED BY TESTERS.** No tester has run them on a real Mac or a real Linux PC yet. They carry the same fixes as Windows v4.0.4 (including the startup crash fix), but expect problems and please report what you find.
 
-### MouseCast v4.0.4
+### MouseCast v4.0.5
 
 **MouseCast** is the dedicated mouse-visualization module.
 
@@ -140,19 +145,19 @@ It supports:
 
 **Windows production build**
 
-`MouseCast_Windows_v4_0_4.py` — **[Download](https://github.com/Akinraze/ControlCast/releases/download/v4.0.4/MouseCast_Windows_v4_0_4.py)**
+`MouseCast_Windows_v4_0_5.py` — **[Download](https://github.com/Akinraze/ControlCast/releases/download/v4.0.5/MouseCast_Windows_v4_0_5.py)**
 
-**macOS Community Test v4.0.4 RC1 — ⚠️ UNTESTED BY TESTERS**
+**macOS Community Test v4.0.5 RC1 — ⚠️ UNTESTED BY TESTERS**
 
-`MouseCast_macOS_v4_0_4_RC1.py`
+`MouseCast_macOS_v4_0_5_RC1.py`
 
-**Linux (X11) Community Test v4.0.4 RC1 — ⚠️ UNTESTED BY TESTERS**
+**Linux (X11) Community Test v4.0.5 RC1 — ⚠️ UNTESTED BY TESTERS**
 
-`MouseCast_Linux_v4_0_4_RC1.py`
+`MouseCast_Linux_v4_0_5_RC1.py`
 
 ---
 
-### InputCast v4.0.4
+### InputCast v4.0.5
 
 **InputCast** is the general reactive-input module.
 
@@ -189,15 +194,15 @@ It supports:
 
 **Windows production build**
 
-`InputCast_Windows_v4_0_4.py` — **[Download](https://github.com/Akinraze/ControlCast/releases/download/v4.0.4/InputCast_Windows_v4_0_4.py)**
+`InputCast_Windows_v4_0_5.py` — **[Download](https://github.com/Akinraze/ControlCast/releases/download/v4.0.5/InputCast_Windows_v4_0_5.py)**
 
-**macOS Community Test v4.0.4 RC1 — ⚠️ UNTESTED BY TESTERS**
+**macOS Community Test v4.0.5 RC1 — ⚠️ UNTESTED BY TESTERS**
 
-`InputCast_macOS_v4_0_4_RC1.py`
+`InputCast_macOS_v4_0_5_RC1.py`
 
-**Linux (X11) Community Test v4.0.4 RC1 — ⚠️ UNTESTED BY TESTERS**
+**Linux (X11) Community Test v4.0.5 RC1 — ⚠️ UNTESTED BY TESTERS**
 
-`InputCast_Linux_v4_0_4_RC1.py`
+`InputCast_Linux_v4_0_5_RC1.py`
 
 ---
 
@@ -205,9 +210,9 @@ It supports:
 
 | Platform | MouseCast | InputCast | Status |
 | --- | --- | --- | --- |
-| Windows | `MouseCast_Windows_v4_0_4.py` | `InputCast_Windows_v4_0_4.py` | **Production** (v4.0.4) |
-| macOS | `MouseCast_macOS_v4_0_4_RC1.py` | `InputCast_macOS_v4_0_4_RC1.py` | **⚠️ UNTESTED BY TESTERS** — Community Test v4.0.4 RC1 |
-| Linux (X11) | `MouseCast_Linux_v4_0_4_RC1.py` | `InputCast_Linux_v4_0_4_RC1.py` | **⚠️ UNTESTED BY TESTERS** — Community Test v4.0.4 RC1 |
+| Windows | `MouseCast_Windows_v4_0_5.py` | `InputCast_Windows_v4_0_5.py` | **Production** (v4.0.5) |
+| macOS | `MouseCast_macOS_v4_0_5_RC1.py` | `InputCast_macOS_v4_0_5_RC1.py` | **⚠️ UNTESTED BY TESTERS** — Community Test v4.0.5 RC1 |
+| Linux (X11) | `MouseCast_Linux_v4_0_5_RC1.py` | `InputCast_Linux_v4_0_5_RC1.py` | **⚠️ UNTESTED BY TESTERS** — Community Test v4.0.5 RC1 |
 
 The Windows builds have been tested and refined directly during development. Profile handling in v4.0.3 was additionally checked with automated tests.
 
@@ -300,18 +305,18 @@ Choose the ControlCast module for your operating system.
 
 For Windows:
 
-- `MouseCast_Windows_v4_0_4.py`
-- `InputCast_Windows_v4_0_4.py`
+- `MouseCast_Windows_v4_0_5.py`
+- `InputCast_Windows_v4_0_5.py`
 
 For macOS community testing (**UNTESTED BY TESTERS**):
 
-- `MouseCast_macOS_v4_0_4_RC1.py`
-- `InputCast_macOS_v4_0_4_RC1.py`
+- `MouseCast_macOS_v4_0_5_RC1.py`
+- `InputCast_macOS_v4_0_5_RC1.py`
 
 For Linux (X11) community testing (**UNTESTED BY TESTERS**):
 
-- `MouseCast_Linux_v4_0_4_RC1.py`
-- `InputCast_Linux_v4_0_4_RC1.py`
+- `MouseCast_Linux_v4_0_5_RC1.py`
+- `InputCast_Linux_v4_0_5_RC1.py`
 
 ---
 
